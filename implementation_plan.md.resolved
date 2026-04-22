@@ -1,0 +1,309 @@
+# Resched.me: Scaffold → Production Implementation Plan
+
+## Current State Assessment
+
+The codebase is a **well-structured scaffold** with the right architectural bones but **zero working integrations**:
+
+| Layer | What exists | What's missing |
+|-------|------------|----------------|
+| **Backend routes** | 6 route files (auth, calendar, ai, scheduling, voice, vision) | All return hardcoded mock data |
+| **Models** | [User](file:///c:/Users/kuday/reschedai/apps/api/app/models/user.py#9-16), [EnergyProfile](file:///c:/Users/kuday/reschedai/apps/api/app/models/energy_profile.py#10-24), [CalendarConnection](file:///c:/Users/kuday/reschedai/apps/api/app/models/calendar_connection.py#9-22) with SQLAlchemy | No migrations, no CRUD operations used |
+| **Services** | 5 service files with function stubs | No OpenAI, Whisper, Google Calendar, or OCR calls |
+| **Auth** | Google OAuth URL builder only | No callback, no token exchange, no JWT, no session |
+| **Frontend** | Landing page with 3 components | No routing, no API calls, no auth, no real calendar |
+| **Infra** | Docker Compose with Postgres + Redis | No Alembic, no Redis usage, uses `create_all` |
+
+## User Review Required
+
+> [!IMPORTANT]
+> This plan assumes you can provide the following secrets before Phase 1 begins:
+> - **Google Cloud Console**: OAuth 2.0 Client ID + Secret (with Calendar API enabled)
+> - **OpenAI API key** (for gpt-4o-mini and Whisper API access)
+
+> [!WARNING]
+> Phase 1 (Google Calendar) is a **hard dependency** for Phases 2–5. We cannot demo real calendar writes until the OAuth flow works end-to-end.
+
+> [!IMPORTANT]
+> **Build order matters.** The phases below are designed so each one produces a demo-able milestone. I recommend tackling them in order (0→8), but feel free to request changes to priority.
+
+---
+
+## Phase 0 — Foundation & Infrastructure
+
+> **Goal:** Production-grade app skeleton — migrations, auth middleware, Redis connection, error handling.
+
+### Backend Core
+
+#### [MODIFY] [config.py](file:///c:/Users/kuday/reschedai/apps/api/app/core/config.py)
+- Add `SECRET_KEY` for JWT signing
+- Add `ACCESS_TOKEN_EXPIRE_MINUTES` setting
+- Add fail-fast validation for critical env vars
+
+#### [MODIFY] [database.py](file:///c:/Users/kuday/reschedai/apps/api/app/core/database.py)
+- Keep [init_db()](file:///c:/Users/kuday/reschedai/apps/api/app/core/database.py#16-21) for dev convenience but add Alembic as primary migration tool
+
+#### [NEW] `apps/api/app/core/security.py`
+- JWT token creation/verification with `python-jose`
+- Password-less auth (Google OAuth only for now)
+- `get_current_user` FastAPI dependency
+
+#### [NEW] `apps/api/app/core/redis.py`
+- `aioredis` connection pool using `settings.redis_url`
+- Session/rate-limit key helpers
+
+#### [NEW] `apps/api/alembic/` (directory)
+- Alembic init + `env.py` wired to SQLAlchemy models
+- Initial migration generating tables from existing models
+
+#### [MODIFY] [main.py](file:///c:/Users/kuday/reschedai/apps/api/app/main.py)
+- Add global exception handler middleware
+- Add structured logging setup
+- Run Alembic migrations on startup (dev mode) or keep separate for prod
+
+#### [MODIFY] [pyproject.toml](file:///c:/Users/kuday/reschedai/apps/api/pyproject.toml)
+- Add new dependencies: `alembic`, `python-jose[cryptography]`, `httpx`, `openai`, `redis`
+
+---
+
+## Phase 1 — Google OAuth + Calendar Integration
+
+> **Goal:** Users can sign in with Google, and the app can read/write their Google Calendar events with an approval workflow.
+
+#### [MODIFY] [auth.py](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/auth.py)
+- Add `GET /auth/google/callback` — exchange code for tokens, create/upsert user, store encrypted Google tokens, return JWT
+- Add `GET /auth/me` — return current user profile
+- Add `POST /auth/logout` — revoke session
+
+#### [MODIFY] [calendar_connection.py](file:///c:/Users/kuday/reschedai/apps/api/app/models/calendar_connection.py)
+- Add `access_token`, `refresh_token`, `token_expires_at` encrypted columns
+
+#### [NEW] `apps/api/app/services/google_calendar.py`
+- Wrapper around Google Calendar API v3 using `httpx`
+- Functions: `list_events()`, [create_event()](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/calendar.py#14-17), `update_event()`, `delete_event()`
+- Automatic token refresh on 401
+
+#### [MODIFY] [calendar.py (service)](file:///c:/Users/kuday/reschedai/apps/api/app/services/calendar.py)
+- Replace hardcoded mocks with calls to `google_calendar.py`
+- Add approval status tracking (pending → approved → synced)
+
+#### [MODIFY] [calendar.py (route)](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/calendar.py)
+- Add `PUT /events/{id}`, `DELETE /events/{id}`
+- Add `POST /events/{id}/approve` — approval workflow trigger
+- Protect all routes with `get_current_user` dependency
+
+#### Frontend changes
+#### [NEW] `apps/web/src/app/login/page.tsx`
+- Google sign-in button, redirect to Google OAuth URL from API
+
+#### [NEW] `apps/web/src/lib/auth.ts`
+- Auth context provider, token storage (localStorage + httpOnly cookie consideration), `useAuth()` hook
+
+#### [NEW] `apps/web/src/components/auth-guard.tsx`
+- Protected route wrapper redirecting unauthenticated users to `/login`
+
+---
+
+## Phase 2 — AI Planning (LLM Integration)
+
+> **Goal:** The AI sidebar sends real prompts to GPT-4o-mini, which returns structured calendar action proposals.
+
+#### [MODIFY] [llm.py](file:///c:/Users/kuday/reschedai/apps/api/app/services/llm.py)
+- Replace mock with real OpenAI Chat Completions API call
+- System prompt with tool definitions for calendar CRUD
+- Parse tool-call responses into [SuggestedAction](file:///c:/Users/kuday/reschedai/apps/api/app/schemas/ai.py#6-9) list
+- Support conversation history (stored in Redis with TTL)
+
+#### [MODIFY] [ai.py (route)](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/ai.py)
+- Add `POST /ai/chat` — streaming endpoint (SSE) for conversational AI
+- Keep `POST /ai/plan` for one-shot planning requests
+- Both require authenticated user
+
+#### [NEW] `apps/api/app/schemas/chat.py`
+- `ChatMessage`, `ChatRequest`, `ChatStreamChunk` schemas
+
+#### Frontend changes
+#### [MODIFY] [ai-sidebar.tsx](file:///c:/Users/kuday/reschedai/apps/web/src/components/ai-sidebar.tsx)
+- Wire to real `/ai/chat` SSE endpoint
+- Render streaming responses
+- Add action buttons for approving/rejecting calendar suggestions
+
+#### [NEW] `apps/web/src/lib/api.ts`
+- Typed API client with auth headers, base URL, error handling
+
+---
+
+## Phase 3 — Energy-Based Scheduling
+
+> **Goal:** Users configure their energy profile, and the AI uses it to place tasks in optimal time slots.
+
+#### [NEW] `apps/api/app/api/routes/energy_profile.py`
+- CRUD endpoints for energy profiles
+- Onboarding-style questionnaire endpoint
+
+#### [MODIFY] [scheduler.py](file:///c:/Users/kuday/reschedai/apps/api/app/services/scheduler.py)
+- Read user's stored energy profile from DB
+- Integrate energy windows into AI scheduler suggestions
+
+#### Frontend changes
+#### [NEW] `apps/web/src/app/settings/page.tsx`
+- Energy profile configuration form (peak hours, slump hours, chronotype)
+
+#### [MODIFY] [calendar-preview.tsx](file:///c:/Users/kuday/reschedai/apps/web/src/components/calendar-preview.tsx)
+- Pull energy profile from API instead of hardcoded values
+
+---
+
+## Phase 4 — Voice-to-Calendar
+
+> **Goal:** User records audio → Whisper transcribes → LLM parses intent → calendar event proposed.
+
+#### [MODIFY] [voice.py (route)](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/voice.py)
+- Accept `multipart/form-data` with audio file
+- Pipeline: upload → Whisper API → LLM intent parse → return proposed event
+
+#### [MODIFY] [voice.py (service)](file:///c:/Users/kuday/reschedai/apps/api/app/services/voice.py)
+- Call OpenAI Whisper API for transcription
+- Pass transcript to LLM for intent extraction
+- Return structured [VoiceCommandResponse](file:///c:/Users/kuday/reschedai/apps/api/app/schemas/voice.py#11-15) with proposed event details
+
+#### [MODIFY] [voice.py (schema)](file:///c:/Users/kuday/reschedai/apps/api/app/schemas/voice.py)
+- Add `proposed_event` field with calendar event details
+- Change request to accept audio file metadata
+
+#### Frontend changes
+#### [NEW] `apps/web/src/components/voice-recorder.tsx`
+- Browser `MediaRecorder` API integration
+- Record → stop → upload → display result
+- Integrate into AI sidebar as input method
+
+---
+
+## Phase 5 — Image-to-Calendar (Kill Feature)
+
+> **Goal:** User uploads a schedule photo → GPT-4o vision extracts events → preview → approve → sync to Google Calendar.
+
+#### [MODIFY] [vision.py (route)](file:///c:/Users/kuday/reschedai/apps/api/app/api/routes/vision.py)
+- Accept `multipart/form-data` with image file
+- Return structured event list for preview
+
+#### [MODIFY] [vision.py (service)](file:///c:/Users/kuday/reschedai/apps/api/app/services/vision.py)
+- Send image to GPT-4o with vision capability
+- Structured output prompt to extract events (title, date, time)
+- Parse response into [ImportedEventPreview](file:///c:/Users/kuday/reschedai/apps/api/app/schemas/vision.py#10-14) list
+
+#### Frontend changes
+#### [NEW] `apps/web/src/components/schedule-import.tsx`
+- Drag-and-drop image upload zone
+- Preview table of extracted events with edit capability
+- "Approve all" / "Reject" / per-event approve buttons
+
+---
+
+## Phase 6 — Frontend App Shell & Routing
+
+> **Goal:** Real multi-page app with dashboard, interactive calendar, and settings.
+
+#### [MODIFY] [page.tsx](file:///c:/Users/kuday/reschedai/apps/web/src/app/page.tsx)
+- Transform from landing page to authenticated dashboard
+- Show real calendar data + AI sidebar
+
+#### [NEW] `apps/web/src/app/dashboard/page.tsx`
+- Main authenticated view with calendar + AI sidebar
+
+#### [NEW] `apps/web/src/app/onboarding/page.tsx`
+- First-time user flow: energy profile setup, Google Calendar connect
+
+#### [NEW] `apps/web/src/components/calendar-view.tsx`
+- Interactive week/month/year calendar (consider `@fullcalendar/react` or custom)
+- Drag-and-drop event editing
+- Visual energy overlays
+
+#### [MODIFY] [layout.tsx](file:///c:/Users/kuday/reschedai/apps/web/src/app/layout.tsx)
+- Add navigation bar, auth provider wrapper
+- Add `next-auth` or custom auth context
+
+---
+
+## Phase 7 — Testing & Quality
+
+> **Goal:** Confidence in shipping — unit, integration, and E2E tests.
+
+#### Backend tests
+#### [MODIFY] [test_health.py](file:///c:/Users/kuday/reschedai/apps/api/tests/test_health.py)
+- Already exists and works
+
+#### [NEW] `apps/api/tests/test_auth.py`
+- Test Google OAuth callback flow with mocked Google API
+- Test JWT token creation and validation
+
+#### [NEW] `apps/api/tests/test_calendar.py`
+- Test CRUD operations with mocked Google Calendar API
+- Test approval workflow state transitions
+
+#### [NEW] `apps/api/tests/test_ai.py`
+- Test LLM planning with mocked OpenAI responses
+
+#### [NEW] `apps/api/tests/conftest.py`
+- Shared fixtures: test DB, test client, mock auth user
+
+#### Frontend tests
+- Component tests with React Testing Library
+- Integration tests for auth flow
+
+---
+
+## Phase 8 — Deployment & Production
+
+> **Goal:** Automated CI/CD, containerized deployment, production hardening.
+
+#### [NEW] `.github/workflows/ci.yml`
+- Run backend tests, lint, type check
+- Run frontend build, lint
+
+#### [MODIFY] [docker-compose.yml](file:///c:/Users/kuday/reschedai/docker-compose.yml)
+- Add production profile with optimized builds
+- Add health checks for all services
+
+#### [NEW] `apps/api/Dockerfile.prod` / `apps/web/Dockerfile.prod`
+- Multi-stage production builds
+
+#### Security & performance
+- Rate limiting middleware (Redis-based)
+- Security headers (HSTS, CSP)
+- API key rotation support
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+**Backend (run from `apps/api/`):**
+```powershell
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run all tests
+pytest tests/ -v
+
+# Run specific test suites
+pytest tests/test_health.py -v
+pytest tests/test_auth.py -v
+pytest tests/test_calendar.py -v
+```
+
+**Frontend (run from `apps/web/`):**
+```powershell
+npm run build   # Ensure no TypeScript/build errors
+```
+
+### Manual Verification
+
+1. **Phase 0**: Start the API with `uvicorn app.main:app --reload`, hit `/docs` — confirm all routes require auth (401 without token)
+2. **Phase 1**: Click "Sign in with Google" on the frontend → complete OAuth → verify JWT returned → verify calendar events load from Google
+3. **Phase 2**: Type a planning prompt in AI sidebar → verify streaming response → verify proposed calendar actions appear
+4. **Phase 4**: Click microphone → speak → verify transcription → verify proposed event
+5. **Phase 5**: Upload a schedule photo → verify extracted events table → approve → verify events appear in calendar
+
+> [!TIP]
+> I recommend tackling **Phase 0 + Phase 1** together as the first sprint, since auth is needed for everything else. Which phase would you like me to start implementing first?

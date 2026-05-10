@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import { DashboardShell } from "@/components/dashboard-shell";
 
 export const metadata: Metadata = {
-  title: "Dashboard | Resched.me",
-  description: "Private Resched.me workspace for calendar planning and AI scheduling.",
+  title: "Dashboard | replanme",
+  description: "Private replanme workspace for calendar planning and AI scheduling.",
   robots: {
     index: false,
     follow: false,

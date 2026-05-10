@@ -5,16 +5,22 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth";
 import { Navbar } from "@/components/navbar";
 import { AiChatPanel } from "@/components/ai-chat-panel";
+import { AccountSettingsModal } from "@/components/account-settings-modal";
+import { PaywallModal } from "@/components/paywall-modal";
 import {
   ScheduleWorkspace,
   type CalendarView,
 } from "@/components/schedule-workspace";
+import type { PaywallPayload } from "@/lib/api";
 
 export function DashboardShell() {
   const { user, loading } = useAuth();
   const router = useRouter();
   const [view, setView] = useState<CalendarView>("week");
   const [calendarRefreshKey, setCalendarRefreshKey] = useState(0);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+  const [paywall, setPaywall] = useState<PaywallPayload | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -22,36 +28,51 @@ export function DashboardShell() {
     }
   }, [loading, router, user]);
 
-  if (loading) {
+  if (loading || !user) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-ink border-t-transparent" />
+      <div className="landing-page flex min-h-screen items-center justify-center">
+        <div className="h-10 w-10 animate-pulse rounded-full bg-[linear-gradient(135deg,var(--purple),var(--teal))]" />
       </div>
     );
   }
 
-  if (!user) {
-    return null;
-  }
-
   return (
-    <>
-      <Navbar />
-      <main className="mx-auto max-w-[1680px] px-4 py-6 md:px-6 xl:px-8">
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.55fr)_400px]">
+    <div className="dashboard-page landing-page">
+      <Navbar onSettingsClick={() => setSettingsOpen(true)} />
+      <main className="dashboard-main">
+        <div className="dashboard-calendar-layer">
           <ScheduleWorkspace
             view={view}
             onViewChange={setView}
             hasGoogleCalendar={user.has_google_calendar}
             timezone={user.timezone}
             refreshKey={calendarRefreshKey}
-          />
-          <AiChatPanel
-            timeframe={view}
-            onCalendarChanged={() => setCalendarRefreshKey((current) => current + 1)}
+            onPaywall={setPaywall}
           />
         </div>
+
+        {chatCollapsed ? (
+          <button
+            type="button"
+            onClick={() => setChatCollapsed(false)}
+            className="dashboard-chat-open-button"
+            aria-label="Open AI assistant"
+          >
+            AI
+          </button>
+        ) : (
+          <div className="dashboard-chat-overlay">
+            <AiChatPanel
+              timeframe={view}
+              onCollapse={() => setChatCollapsed(true)}
+              onCalendarChanged={() => setCalendarRefreshKey((current) => current + 1)}
+              onPaywall={setPaywall}
+            />
+          </div>
+        )}
       </main>
-    </>
+      {settingsOpen && <AccountSettingsModal user={user} onClose={() => setSettingsOpen(false)} />}
+      <PaywallModal paywall={paywall} onClose={() => setPaywall(null)} />
+    </div>
   );
 }

@@ -1,16 +1,17 @@
 import type { Metadata } from "next";
-import { IBM_Plex_Sans, Sora } from "next/font/google";
+import { Epilogue, Syne } from "next/font/google";
 import { AuthProvider } from "@/lib/auth";
 import "./globals.css";
 
 const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 
-const sora = Sora({
+const syne = Syne({
   subsets: ["latin"],
   variable: "--font-display",
+  weight: ["500", "600", "700", "800"],
 });
 
-const plexSans = IBM_Plex_Sans({
+const epilogue = Epilogue({
   subsets: ["latin"],
   variable: "--font-body",
   weight: ["400", "500", "600", "700"],
@@ -19,14 +20,14 @@ const plexSans = IBM_Plex_Sans({
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: {
-    default: "Resched.me",
-    template: "%s | Resched.me",
+    default: "replanme",
+    template: "%s | replanme",
   },
   description: "AI-assisted scheduling for Google Calendar, weekly planning, and monthly planning.",
-  applicationName: "Resched.me",
+  applicationName: "replanme",
   category: "productivity",
   openGraph: {
-    siteName: "Resched.me",
+    siteName: "replanme",
     type: "website",
   },
   twitter: {
@@ -41,7 +42,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${sora.variable} ${plexSans.variable}`}>
+      <body className={`${syne.variable} ${epilogue.variable}`}>
         <AuthProvider>{children}</AuthProvider>
       </body>
     </html>

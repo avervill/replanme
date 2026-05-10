@@ -17,7 +17,10 @@ from app.core.security import create_access_token, encrypt_token, get_current_us
 from app.models.calendar_connection import CalendarConnection
 from app.models.user import User
 from app.schemas.auth import TokenResponse, UserResponse
+from app.services import analytics
+from app.services.credits import grant_signup_credits_if_needed, maybe_refill_credits
 from app.services.google_calendar import exchange_google_code, get_google_userinfo
+from app.services.paywall import normalize_subscription_status
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -104,13 +107,20 @@ async def google_callback(
 
     if user is None:
         user = User(email=email, full_name=full_name)
+        user.is_admin = email.casefold() in settings.admin_email_set
         db.add(user)
         await db.flush()
+        await grant_signup_credits_if_needed(db, user)
+        await analytics.track_event(db, user.id, "user_signed_up", {"provider": "google"})
         logger.info("Created new user %s (%s)", user.id, email)
     else:
         if full_name and user.full_name != full_name:
             user.full_name = full_name
-            db.add(user)
+        user.is_admin = user.is_admin or email.casefold() in settings.admin_email_set
+        db.add(user)
+        await grant_signup_credits_if_needed(db, user)
+        await maybe_refill_credits(db, user.id)
+        await analytics.track_event(db, user.id, "user_logged_in", {"provider": "google"})
 
     # 4. Upsert calendar connection with encrypted tokens
     result = await db.execute(
@@ -137,6 +147,7 @@ async def google_callback(
             token_expires_at=token_expiry,
         )
         db.add(conn)
+        await analytics.track_event(db, user.id, "google_calendar_connected", {"provider": "google"})
     else:
         conn.access_token = encrypted_access
         if encrypted_refresh:
@@ -172,6 +183,12 @@ async def get_current_user_profile(
         )
     )
     has_calendar = result.scalar_one_or_none() is not None
+    user.is_admin = user.is_admin or user.email.casefold() in settings.admin_email_set
+    await grant_signup_credits_if_needed(db, user)
+    await maybe_refill_credits(db, user.id)
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
 
     return UserResponse(
         id=user.id,
@@ -179,6 +196,10 @@ async def get_current_user_profile(
         full_name=user.full_name,
         timezone=user.timezone,
         has_google_calendar=has_calendar,
+        plan=user.plan or "free",
+        subscription_status=normalize_subscription_status(user.subscription_status),
+        planning_credits=int(user.planning_credits or 0),
+        is_admin=bool(user.is_admin),
     )
 
 

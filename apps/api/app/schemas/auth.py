@@ -18,5 +18,9 @@ class UserResponse(BaseModel):
     full_name: str | None = None
     timezone: str = "UTC"
     has_google_calendar: bool = False
+    plan: str = "free"
+    subscription_status: str = "none"
+    planning_credits: int = 0
+    is_admin: bool = False
 
     model_config = {"from_attributes": True}

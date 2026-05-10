@@ -32,6 +32,8 @@ class CalendarEventUpdate(BaseModel):
     end_at: datetime | None = None
     timezone: str | None = None
     location: str | None = None
+    reminders: list[int] | None = None
+    metadata: dict[str, str] | None = None
 
 
 class CalendarEventResponse(CalendarEventBase):

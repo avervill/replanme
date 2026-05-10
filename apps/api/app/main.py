@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.core.logging import setup_logging
 from app.core.redis import close_redis
+from app.services.subscriptions import PaywallError
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,11 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         status_code=500,
         content={"detail": "Internal server error"},
     )
+
+
+@app.exception_handler(PaywallError)
+async def paywall_exception_handler(request: Request, exc: PaywallError) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content=exc.payload)
 
 
 # ---------------------------------------------------------------------------

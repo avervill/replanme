@@ -121,9 +121,27 @@ async def list_google_events(
     user_id, db: AsyncSession, *, max_results: int = 250
 ) -> list[dict]:
     """List upcoming events from the user's primary Google Calendar."""
+    now = datetime.now(UTC)
+    return await list_google_events_in_range(
+        user_id,
+        db,
+        start_at=now - timedelta(days=90),
+        end_at=now + timedelta(days=365),
+        max_results=max_results,
+    )
+
+
+async def list_google_events_in_range(
+    user_id,
+    db: AsyncSession,
+    *,
+    start_at: datetime,
+    end_at: datetime,
+    max_results: int = 250,
+) -> list[dict]:
+    """List events for a specific time window from the user's primary calendar."""
     conn = await _get_connection(user_id, db)
     access = await _ensure_valid_token(conn, db)
-    now = datetime.now(UTC)
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
@@ -133,8 +151,8 @@ async def list_google_events(
                 "maxResults": max_results,
                 "singleEvents": "true",
                 "orderBy": "startTime",
-                "timeMin": (now - timedelta(days=90)).isoformat(),
-                "timeMax": (now + timedelta(days=365)).isoformat(),
+                "timeMin": start_at.isoformat(),
+                "timeMax": end_at.isoformat(),
             },
         )
         resp.raise_for_status()
@@ -170,6 +188,25 @@ async def update_google_event(
             f"{GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}",
             headers={"Authorization": f"Bearer {access}"},
             json=event_body,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def get_google_event(
+    user_id,
+    db: AsyncSession,
+    *,
+    event_id: str,
+) -> dict:
+    """Fetch a specific event from the user's primary Google Calendar."""
+    conn = await _get_connection(user_id, db)
+    access = await _ensure_valid_token(conn, db)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{GOOGLE_CALENDAR_BASE}/calendars/primary/events/{event_id}",
+            headers={"Authorization": f"Bearer {access}"},
         )
         resp.raise_for_status()
         return resp.json()

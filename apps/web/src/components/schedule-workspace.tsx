@@ -14,11 +14,14 @@ import {
   deleteCalendarEvent,
   fetchCalendarEvents,
   getGoogleAuthUrl,
+  isPaywallError,
   updateCalendarEvent,
   type CalendarEventInput,
   type CalendarEventUpdateInput,
   type GoogleCalendarEvent,
+  type PaywallPayload,
 } from "@/lib/api";
+import { EventCard } from "./event-card";
 
 export type CalendarView = "week" | "month";
 
@@ -28,6 +31,7 @@ type ScheduleWorkspaceProps = {
   hasGoogleCalendar: boolean;
   timezone?: string;
   refreshKey?: number;
+  onPaywall?: (payload: PaywallPayload) => void;
 };
 
 type NormalizedCalendarEvent = {
@@ -53,21 +57,21 @@ type EventDraft = {
 type EventEditorState =
   | { mode: "closed" }
   | {
-      mode: "create";
-      draft: EventDraft;
-      error: string | null;
-      submitting: boolean;
-      deleting: boolean;
-    }
+    mode: "create";
+    draft: EventDraft;
+    error: string | null;
+    submitting: boolean;
+    deleting: boolean;
+  }
   | {
-      mode: "edit";
-      event: NormalizedCalendarEvent;
-      originalDraft: EventDraft;
-      draft: EventDraft;
-      error: string | null;
-      submitting: boolean;
-      deleting: boolean;
-    };
+    mode: "edit";
+    event: NormalizedCalendarEvent;
+    originalDraft: EventDraft;
+    draft: EventDraft;
+    error: string | null;
+    submitting: boolean;
+    deleting: boolean;
+  };
 
 type DragState = {
   event: NormalizedCalendarEvent;
@@ -390,15 +394,15 @@ function EventEditorModal({
   onDelete: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-ink/35 px-4 py-6 backdrop-blur-sm">
-      <div className="glass-panel w-full max-w-2xl rounded-[2rem] p-6 md:p-7">
+    <div className="dashboard-modal-backdrop fixed inset-0 z-[120] flex items-center justify-center bg-calm-primary/35 px-4 py-6 backdrop-blur-sm">
+      <div className="dashboard-modal glass-panel w-full max-w-2xl rounded-[2rem] p-6 md:p-7">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="eyebrow">Schedule editor</p>
-            <h2 className="display-font mt-2 text-3xl font-semibold text-ink">
+            <h2 className="display-font mt-2 text-3xl font-semibold text-white">
               {state.mode === "create" ? "Create event" : "Edit event"}
             </h2>
-            <p className="mt-2 text-sm leading-7 text-slate-600">
+            <p className="mt-2 text-sm leading-7 text-calm-muted">
               Save changes directly to your Google Calendar.
             </p>
           </div>
@@ -406,71 +410,71 @@ function EventEditorModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded-full border border-black/10 bg-white/80 px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-100"
+            className="rounded-full border border-[rgba(255,255,255,0.06)] bg-white/80 px-3 py-2 text-sm text-calm-muted transition hover:bg-[rgba(255,255,255,0.05)]"
           >
             Close
           </button>
         </div>
 
         {state.error && (
-          <div className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900">
+          <div className="mt-5 rounded-2xl border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-900">
             {state.error}
           </div>
         )}
 
         <div className="mt-6 grid gap-4 md:grid-cols-2">
           <label className="md:col-span-2">
-            <span className="mb-2 block text-sm font-semibold text-slate-700">Title</span>
+            <span className="mb-2 block text-sm font-semibold text-calm-text">Title</span>
             <input
               value={state.draft.title}
               onChange={(event) => onChange("title", event.target.value)}
-              className="w-full rounded-2xl border border-black/10 bg-white/90 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-ember"
+              className="w-full rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-3 text-sm text-calm-text outline-none transition focus:border-ember"
               placeholder="Team sync"
             />
           </label>
 
           <label>
-            <span className="mb-2 block text-sm font-semibold text-slate-700">Start</span>
+            <span className="mb-2 block text-sm font-semibold text-calm-text">Start</span>
             <input
               type="datetime-local"
               value={state.draft.startAt}
               onChange={(event) => onChange("startAt", event.target.value)}
-              className="w-full rounded-2xl border border-black/10 bg-white/90 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-ember"
+              className="w-full rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-3 text-sm text-calm-text outline-none transition focus:border-ember"
             />
           </label>
 
           <label>
-            <span className="mb-2 block text-sm font-semibold text-slate-700">End</span>
+            <span className="mb-2 block text-sm font-semibold text-calm-text">End</span>
             <input
               type="datetime-local"
               value={state.draft.endAt}
               onChange={(event) => onChange("endAt", event.target.value)}
-              className="w-full rounded-2xl border border-black/10 bg-white/90 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-ember"
+              className="w-full rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-3 text-sm text-calm-text outline-none transition focus:border-ember"
             />
           </label>
 
           <label>
-            <span className="mb-2 block text-sm font-semibold text-slate-700">Location</span>
+            <span className="mb-2 block text-sm font-semibold text-calm-text">Location</span>
             <input
               value={state.draft.location}
               onChange={(event) => onChange("location", event.target.value)}
-              className="w-full rounded-2xl border border-black/10 bg-white/90 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-ember"
+              className="w-full rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-3 text-sm text-calm-text outline-none transition focus:border-ember"
               placeholder="Zoom or office"
             />
           </label>
 
-          <div className="rounded-2xl border border-black/10 bg-white/70 px-4 py-3">
-            <p className="text-sm font-semibold text-slate-700">Timezone</p>
-            <p className="mt-1 text-sm text-slate-500">{timezone}</p>
+          <div className="rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent px-4 py-3">
+            <p className="text-sm font-semibold text-calm-text">Timezone</p>
+            <p className="mt-1 text-sm text-calm-muted opacity-80">{timezone}</p>
           </div>
 
           <label className="md:col-span-2">
-            <span className="mb-2 block text-sm font-semibold text-slate-700">Description</span>
+            <span className="mb-2 block text-sm font-semibold text-calm-text">Description</span>
             <textarea
               rows={4}
               value={state.draft.description}
               onChange={(event) => onChange("description", event.target.value)}
-              className="w-full resize-none rounded-2xl border border-black/10 bg-white/90 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-ember"
+              className="w-full resize-none rounded-2xl border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-3 text-sm text-calm-text outline-none transition focus:border-ember"
               placeholder="Agenda or notes"
             />
           </label>
@@ -483,7 +487,7 @@ function EventEditorModal({
                 type="button"
                 onClick={onDelete}
                 disabled={state.deleting || state.submitting}
-                className="rounded-full border border-red-200 bg-red-50 px-4 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:cursor-wait disabled:opacity-70"
+                className="rounded-full border border-red-500/20 bg-red-500/5 px-4 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:cursor-wait disabled:opacity-70"
               >
                 {state.deleting ? "Deleting..." : "Delete"}
               </button>
@@ -494,7 +498,7 @@ function EventEditorModal({
             <button
               type="button"
               onClick={onClose}
-              className="rounded-full border border-black/10 bg-white/80 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
+              className="rounded-full border border-[rgba(255,255,255,0.06)] bg-white/80 px-4 py-2 text-sm font-medium text-calm-text transition hover:bg-[rgba(255,255,255,0.05)]"
             >
               Cancel
             </button>
@@ -502,7 +506,7 @@ function EventEditorModal({
               type="button"
               onClick={onSave}
               disabled={state.submitting || state.deleting}
-              className="rounded-full bg-ink px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-wait disabled:bg-slate-500"
+              className="rounded-full bg-calm-primary px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-wait disabled:bg-[rgba(255,255,255,0.02)]0"
             >
               {state.submitting ? "Saving..." : state.mode === "create" ? "Create event" : "Save changes"}
             </button>
@@ -519,6 +523,7 @@ export function ScheduleWorkspace({
   hasGoogleCalendar,
   timezone,
   refreshKey,
+  onPaywall,
 }: ScheduleWorkspaceProps) {
   const [anchorDate, setAnchorDate] = useState(() => new Date());
   const [events, setEvents] = useState<NormalizedCalendarEvent[]>([]);
@@ -528,7 +533,33 @@ export function ScheduleWorkspace({
   const [editorState, setEditorState] = useState<EventEditorState>({ mode: "closed" });
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dragSavingEventId, setDragSavingEventId] = useState<string | null>(null);
+  const [ignoredConflicts, setIgnoredConflicts] = useState<Set<string>>(new Set());
   const weekBoardRef = useRef<HTMLDivElement | null>(null);
+
+  const conflictEventIds = useMemo(() => {
+    const overlaps = new Set<string>();
+    for (let i = 0; i < events.length; i++) {
+      for (let j = i + 1; j < events.length; j++) {
+        const a = events[i];
+        const b = events[j];
+        if (a.isAllDay || b.isAllDay) continue;
+        if (a.startAt < b.endAt && b.startAt < a.endAt) {
+          if (!ignoredConflicts.has(a.id)) overlaps.add(a.id);
+          if (!ignoredConflicts.has(b.id)) overlaps.add(b.id);
+        }
+      }
+    }
+    return overlaps;
+  }, [events, ignoredConflicts]);
+
+  const quickDeleteEvent = async (id: string) => {
+    setEvents((cur) => cur.filter((e) => e.id !== id));
+    try {
+      await deleteCalendarEvent(id);
+    } catch {
+      /* ignore */
+    }
+  };
 
   const resolvedTimezone = timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   const weekDays = useMemo(() => buildWeekDays(anchorDate), [anchorDate]);
@@ -737,20 +768,26 @@ export function ScheduleWorkspace({
           end_at: updatedEvent.endAt.toISOString(),
           timezone: resolvedTimezone,
         });
-      } catch (error: unknown) {
-        setEvents((current) =>
-          current.map((item) => (item.id === state.event.id ? state.event : item)),
-        );
-        setError(
-          error instanceof ApiError || error instanceof Error
+        await refreshEvents();
+    } catch (error: unknown) {
+      if (isPaywallError(error)) {
+        onPaywall?.(error.payload);
+      }
+      setEvents((current) =>
+        current.map((item) => (item.id === state.event.id ? state.event : item)),
+      );
+      setError(
+          isPaywallError(error)
+            ? error.payload.message
+            : error instanceof ApiError || error instanceof Error
             ? error.message
             : "Failed to move the event.",
-        );
+      );
       } finally {
         setDragSavingEventId(null);
       }
     },
-    [refreshEvents, resolvedTimezone],
+    [onPaywall, refreshEvents, resolvedTimezone],
   );
 
   const startWeekDrag = (
@@ -802,7 +839,7 @@ export function ScheduleWorkspace({
       const minuteOffset =
         Math.round(
           (event.clientY - dragState.startClientY) /
-            ((HOUR_ROW_HEIGHT / 60) * DRAG_SNAP_MINUTES),
+          ((HOUR_ROW_HEIGHT / 60) * DRAG_SNAP_MINUTES),
         ) * DRAG_SNAP_MINUTES;
       const currentMinutes = clamp(
         dragState.originStartMinutes + minuteOffset,
@@ -816,15 +853,15 @@ export function ScheduleWorkspace({
       setDragState((current) =>
         current
           ? {
-              ...current,
-              currentDayIndex,
-              currentStartAt,
-              currentEndAt,
-              moved:
-                current.moved ||
-                Math.abs(event.clientX - dragState.startClientX) > 6 ||
-                Math.abs(event.clientY - dragState.startClientY) > 6,
-            }
+            ...current,
+            currentDayIndex,
+            currentStartAt,
+            currentEndAt,
+            moved:
+              current.moved ||
+              Math.abs(event.clientX - dragState.startClientX) > 6 ||
+              Math.abs(event.clientY - dragState.startClientY) > 6,
+          }
           : current,
       );
     };
@@ -953,8 +990,13 @@ export function ScheduleWorkspace({
       await refreshEvents();
       closeEditor();
     } catch (error: unknown) {
+      if (isPaywallError(error)) {
+        onPaywall?.(error.payload);
+      }
       const message =
-        error instanceof ApiError || error instanceof Error
+        isPaywallError(error)
+          ? error.payload.message
+          : error instanceof ApiError || error instanceof Error
           ? error.message
           : "Failed to save the event.";
 
@@ -980,8 +1022,13 @@ export function ScheduleWorkspace({
       await refreshEvents();
       closeEditor();
     } catch (error: unknown) {
+      if (isPaywallError(error)) {
+        onPaywall?.(error.payload);
+      }
       const message =
-        error instanceof ApiError || error instanceof Error
+        isPaywallError(error)
+          ? error.payload.message
+          : error instanceof ApiError || error instanceof Error
           ? error.message
           : "Failed to delete the event.";
 
@@ -998,18 +1045,17 @@ export function ScheduleWorkspace({
 
   return (
     <>
-      <section className="glass-panel flex min-h-[760px] flex-col overflow-hidden rounded-[2rem]">
-        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-black/5 px-5 py-4 md:px-6">
+      <section className="dashboard-calendar glass-panel flex min-h-[760px] flex-col overflow-hidden rounded-[2rem]">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[rgba(255,255,255,0.06)] px-5 py-4 md:px-6">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="rounded-full border border-black/10 bg-white/90 p-1">
+            <div className="rounded-full border border-[rgba(255,255,255,0.06)] bg-transparent text-white p-1">
               {(["week", "month"] as CalendarView[]).map((option) => (
                 <button
                   key={option}
                   type="button"
                   onClick={() => onViewChange(option)}
-                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
-                    option === view ? "bg-ink text-white" : "text-slate-600 hover:bg-slate-100"
-                  }`}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${option === view ? "bg-calm-primary text-white" : "text-calm-muted hover:bg-[rgba(255,255,255,0.05)]"
+                    }`}
                 >
                   {option === "week" ? "Weekly" : "Monthly"}
                 </button>
@@ -1019,31 +1065,31 @@ export function ScheduleWorkspace({
             <button
               type="button"
               onClick={() => shiftPeriod(-1)}
-              className="rounded-full border border-black/10 bg-white/85 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
+              className="rounded-full border border-[rgba(255,255,255,0.06)] bg-transparent px-4 py-2 text-sm font-medium text-calm-text transition hover:bg-[rgba(255,255,255,0.05)]"
             >
               Previous
             </button>
             <button
               type="button"
               onClick={() => setAnchorDate(new Date())}
-              className="rounded-full bg-ink px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
+              className="rounded-full bg-calm-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800"
             >
               Today
             </button>
             <button
               type="button"
               onClick={() => shiftPeriod(1)}
-              className="rounded-full border border-black/10 bg-white/85 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
+              className="rounded-full border border-[rgba(255,255,255,0.06)] bg-transparent px-4 py-2 text-sm font-medium text-calm-text transition hover:bg-[rgba(255,255,255,0.05)]"
             >
               Next
             </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <span className="rounded-full bg-mist px-4 py-2 text-sm font-semibold text-ink">
+            <span className="rounded-full bg-[rgba(255,255,255,0.05)] px-4 py-2 text-sm font-semibold text-white">
               {periodLabel}
             </span>
-            <span className="rounded-full border border-black/10 bg-white/80 px-4 py-2 text-sm text-slate-600">
+            <span className="rounded-full border border-[rgba(255,255,255,0.06)] bg-white/80 px-4 py-2 text-sm text-calm-muted">
               {visibleEventCount} events
             </span>
             <button
@@ -1056,7 +1102,7 @@ export function ScheduleWorkspace({
             <button
               type="button"
               onClick={refreshEvents}
-              className="rounded-full border border-black/10 bg-white/90 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
+              className="rounded-full border border-[rgba(255,255,255,0.06)] bg-transparent text-white px-4 py-2 text-sm font-medium text-calm-text transition hover:bg-[rgba(255,255,255,0.05)]"
             >
               {refreshing ? "Refreshing..." : "Refresh"}
             </button>
@@ -1065,12 +1111,12 @@ export function ScheduleWorkspace({
 
         {!hasGoogleCalendar ? (
           <div className="flex flex-1 items-center justify-center p-8">
-            <div className="max-w-xl rounded-[1.75rem] border border-amber-200 bg-amber-50 p-8 text-center">
+            <div className="max-w-xl rounded-[1.75rem] border border-amber-500/20 bg-amber-500/5 p-8 text-center">
               <p className="eyebrow !text-amber-700">Google Calendar</p>
-              <h2 className="display-font mt-3 text-3xl font-semibold text-amber-950">
+              <h2 className="display-font mt-3 text-3xl font-semibold text-amber-100">
                 Connect your calendar to unlock the full schedule view
               </h2>
-              <p className="mt-4 text-sm leading-7 text-amber-900/80">
+              <p className="mt-4 text-sm leading-7 text-amber-200/80">
                 This board renders your real Google Calendar data and lets you create or edit
                 events directly from the dashboard.
               </p>
@@ -1087,17 +1133,17 @@ export function ScheduleWorkspace({
           <div className="flex flex-1 items-center justify-center">
             <div className="text-center">
               <div className="mx-auto h-10 w-10 animate-spin rounded-full border-4 border-ink border-t-transparent" />
-              <p className="mt-4 text-sm text-slate-600">Loading your Google Calendar...</p>
+              <p className="mt-4 text-sm text-calm-muted">Loading your Google Calendar...</p>
             </div>
           </div>
         ) : error ? (
           <div className="flex flex-1 items-center justify-center p-8">
-            <div className="max-w-xl rounded-[1.75rem] border border-red-200 bg-red-50 p-8 text-center">
+            <div className="max-w-xl rounded-[1.75rem] border border-red-500/20 bg-red-500/5 p-8 text-center">
               <p className="eyebrow !text-red-700">Calendar error</p>
-              <h2 className="mt-3 text-2xl font-semibold text-red-950">
+              <h2 className="mt-3 text-2xl font-semibold text-red-100">
                 We could not load events from Google Calendar
               </h2>
-              <p className="mt-3 text-sm leading-7 text-red-900/80">{error}</p>
+              <p className="mt-3 text-sm leading-7 text-red-200/80">{error}</p>
               <button
                 type="button"
                 onClick={refreshEvents}
@@ -1108,8 +1154,16 @@ export function ScheduleWorkspace({
             </div>
           </div>
         ) : view === "week" ? (
-          <div className="flex-1 overflow-hidden bg-white/78">
-            <div className="h-full overflow-auto">
+          <div className="dashboard-week-view flex-1 overflow-hidden relative">
+            {visibleEventCount === 0 && !loading && (
+              <div className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none">
+                <div className="dashboard-empty-state max-w-sm text-center pointer-events-auto">
+                  <h3 className="text-calm-text font-bold text-lg">Your schedule is empty.</h3>
+                  <p className="text-calm-muted text-sm mt-2">Tell me what you want to plan using the AI panel, or click anywhere to add an event.</p>
+                </div>
+              </div>
+            )}
+            <div className="dashboard-calendar-scroll h-full overflow-auto">
               <div
                 ref={weekBoardRef}
                 className="relative min-w-[1120px]"
@@ -1119,7 +1173,7 @@ export function ScheduleWorkspace({
                   gridTemplateRows: `${HEADER_HEIGHT}px ${ALL_DAY_HEIGHT}px ${weekBodyHeight}px`,
                 }}
               >
-                <div className="border-b border-black/10 bg-white/70 px-3 py-5 text-sm font-medium text-slate-600">
+                <div className="border-b border-[rgba(255,255,255,0.06)] bg-transparent px-3 py-5 text-sm font-medium text-calm-muted">
                   {timezoneLabel}
                 </div>
 
@@ -1131,34 +1185,32 @@ export function ScheduleWorkspace({
                   return (
                     <div
                       key={`header-${dayKey}`}
-                      className="border-b border-black/10 bg-white/70 px-4 py-3"
+                      className="border-b border-[rgba(255,255,255,0.06)] bg-transparent px-4 py-3"
                     >
                       <div className="flex h-full flex-col items-center justify-center gap-1">
                         <span
-                          className={`text-sm font-semibold uppercase tracking-[0.18em] ${
-                            isToday ? "text-[#2563d8]" : "text-slate-600"
-                          }`}
+                          className={`text-sm font-semibold uppercase tracking-[0.18em] ${isToday ? "text-[#2563d8]" : "text-calm-muted"
+                            }`}
                         >
                           {weekdayFormatter.format(day)}
                         </span>
                         <span
-                          className={`flex h-14 w-14 items-center justify-center rounded-full text-2xl font-medium ${
-                            isToday
-                              ? "bg-[#2563d8] text-white"
-                              : "text-ink"
-                          }`}
+                          className={`flex h-14 w-14 items-center justify-center rounded-full text-2xl font-medium ${isToday
+                            ? "bg-[#2563d8] text-white"
+                            : "text-white"
+                            }`}
                         >
                           {dayNumberFormatter.format(day)}
                         </span>
                         <button
                           type="button"
                           onClick={() => openCreateEditor(day)}
-                          className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400 transition hover:text-ink"
+                          className="text-[11px] font-semibold uppercase tracking-[0.14em] text-calm-muted opacity-70 transition hover:text-white"
                         >
                           Add
                         </button>
                         {allDayEvents.length > 0 && (
-                          <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                          <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-calm-muted opacity-70">
                             {allDayEvents.length} all-day
                           </span>
                         )}
@@ -1167,14 +1219,14 @@ export function ScheduleWorkspace({
                   );
                 })}
 
-                <div className="border-b border-black/10 bg-white/75" />
+                <div className="border-b border-[rgba(255,255,255,0.06)] bg-[rgba(255,255,255,0.02)]" />
 
                 {weekDays.map((day) => {
                   const allDayEvents = weekAllDayEventsByDay.get(getDateKey(day)) ?? [];
                   return (
                     <div
                       key={`allday-${getDateKey(day)}`}
-                      className="border-b border-black/10 border-l border-black/10 bg-white/65 px-2 py-1"
+                      className="border-b border-[rgba(255,255,255,0.06)] border-l border-[rgba(255,255,255,0.06)] bg-[rgba(255,255,255,0.01)] px-2 py-1"
                     >
                       <div className="flex gap-1 overflow-x-auto">
                         {allDayEvents.slice(0, 2).map((event) => (
@@ -1182,13 +1234,12 @@ export function ScheduleWorkspace({
                             key={event.id}
                             type="button"
                             onClick={() => openEditEditor(event)}
-                            className={`min-w-0 rounded-full px-3 py-1 text-xs font-medium transition ${
-                              isPastEvent(event)
-                                ? "bg-slate-100 text-slate-400 line-through hover:bg-slate-100"
-                                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
-                            }`}
+                            className={`min-w-0 rounded-full px-3 py-1 text-xs font-medium transition ${isPastEvent(event)
+                              ? "bg-[rgba(255,255,255,0.05)] text-calm-muted opacity-70 line-through hover:bg-[rgba(255,255,255,0.05)]"
+                              : "bg-[rgba(255,255,255,0.05)] text-calm-text hover:bg-[rgba(255,255,255,0.08)]"
+                              }`}
                           >
-                            <span className="block truncate">{event.title}</span>
+                            <span className="block whitespace-normal break-words">{event.title}</span>
                           </button>
                         ))}
                       </div>
@@ -1196,11 +1247,11 @@ export function ScheduleWorkspace({
                   );
                 })}
 
-                <div className="relative border-r border-black/10 bg-white/70">
+                <div className="relative border-r border-[rgba(255,255,255,0.06)] bg-transparent">
                   {timeLabels.map((time) => (
                     <div
                       key={`time-${time.getHours()}`}
-                      className="absolute left-0 right-0 border-t border-black/10 px-2 pt-1 text-right text-sm text-slate-600"
+                      className="absolute left-0 right-0 border-t border-[rgba(255,255,255,0.06)] px-2 pt-1 text-right text-sm text-calm-muted"
                       style={{ top: (time.getHours() - WEEK_START_HOUR) * HOUR_ROW_HEIGHT }}
                     >
                       {hourLabelFormatter.format(time)}
@@ -1219,7 +1270,7 @@ export function ScheduleWorkspace({
                   return (
                     <div
                       key={`column-${getDateKey(day)}`}
-                      className="relative border-l border-black/10"
+                      className="relative border-l border-[rgba(255,255,255,0.06)]"
                       style={{
                         backgroundImage:
                           "repeating-linear-gradient(to bottom, transparent 0, transparent 75px, rgba(17, 33, 45, 0.12) 75px, rgba(17, 33, 45, 0.12) 76px)",
@@ -1234,7 +1285,7 @@ export function ScheduleWorkspace({
                             key={`slot-${getDateKey(day)}-${index}`}
                             type="button"
                             onClick={() => openCreateEditor(slotDate)}
-                            className="absolute left-0 right-0 border-t border-transparent transition hover:bg-[#2563d8]/[0.04]"
+                            className="absolute left-0 right-0 border-t border-transparent transition hover:bg-[rgba(255,255,255,0.02)]"
                             style={{
                               top: index * HOUR_ROW_HEIGHT,
                               height: HOUR_ROW_HEIGHT,
@@ -1246,6 +1297,7 @@ export function ScheduleWorkspace({
                       {positionedEvents.map((positionedEvent) => {
                         const { event } = positionedEvent;
                         const isPast = isPastEvent(event);
+                        const isConflict = conflictEventIds.has(event.id);
                         return (
                           <div
                             key={event.id}
@@ -1260,13 +1312,8 @@ export function ScheduleWorkspace({
                                 openEditEditor(event);
                               }
                             }}
-                            className={`absolute z-10 select-none overflow-hidden rounded-2xl border px-3 py-2 text-left shadow-[0_8px_20px_rgba(37,99,216,0.14)] transition focus:outline-none focus:ring-2 focus:ring-[#2563d8]/25 touch-none ${
-                              isPast
-                                ? "border-slate-300 bg-slate-100/80 text-slate-500 opacity-70 hover:bg-slate-100"
-                                : "border-[#2563d8]/15 bg-[#2563d8]/10 text-[#123a7a] hover:bg-[#2563d8]/15"
-                            } ${
-                              dragSavingEventId === event.id ? "cursor-wait opacity-60" : "cursor-grab"
-                            }`}
+                            className={`absolute z-10 select-none overflow-hidden touch-none ${dragSavingEventId === event.id ? "cursor-wait opacity-60" : "cursor-pointer"
+                              } ${isPast ? "opacity-60" : ""}`}
                             style={{
                               top: positionedEvent.top + 4,
                               height: Math.max(positionedEvent.height - 8, 28),
@@ -1274,69 +1321,71 @@ export function ScheduleWorkspace({
                               width: `calc(${positionedEvent.widthPercent}% - 0.75rem)`,
                             }}
                           >
-                            <p
-                              className={`text-[11px] font-semibold uppercase tracking-[0.14em] ${
-                                isPast ? "text-slate-400 line-through" : "text-[#2563d8]"
-                              }`}
-                            >
-                              {formatTimeRange(event)}
-                            </p>
-                            <p className={`mt-1 truncate text-sm font-semibold ${isPast ? "line-through" : ""}`}>
-                              {event.title}
-                            </p>
-                            {event.location && (
-                              <p className={`truncate text-xs ${isPast ? "line-through text-slate-400" : "text-[#123a7a]/70"}`}>
-                                {event.location}
-                              </p>
-                            )}
+                            <EventCard
+                              id={event.id}
+                              title={event.title}
+                              startTime={formatTimeRange(event).split(' - ')[0]}
+                              endTime={formatTimeRange(event).split(' - ')[1] || ""}
+                              type={event.title?.toLowerCase().includes('study') ? 'study' : (event.title?.toLowerCase().includes('work') || event.title?.toLowerCase().includes('sync') ? 'work' : (event.title?.toLowerCase().includes('lunch') ? 'personal' : 'default'))}
+                              isConflict={isConflict}
+                              onEdit={() => openEditEditor(event)}
+                              onDelete={() => quickDeleteEvent(event.id)}
+                              onMove={() => { }}
+                              onResolveConflict={(id) => {
+                                // Simple auto resolution logic
+                                const startCopy = new Date(event.startAt);
+                                startCopy.setHours(startCopy.getHours() + 1);
+                                const endCopy = new Date(startCopy);
+                                endCopy.setMinutes(startCopy.getMinutes() + ((event.endAt.getTime() - event.startAt.getTime()) / 60000));
+                                setEvents((cur) => cur.map((e) => e.id === id ? { ...e, startAt: startCopy, endAt: endCopy } : e));
+                                updateCalendarEvent(id, {
+                                  start_at: startCopy.toISOString(),
+                                  end_at: endCopy.toISOString(),
+                                  timezone: resolvedTimezone
+                                });
+                              }}
+                              onIgnoreConflict={(id) => {
+                                setIgnoredConflicts((prev) => { const n = new Set(prev); n.add(id); return n; });
+                              }}
+                              className="w-full h-full border-none shadow-[0_8px_20px_rgba(37,99,216,0.14)]"
+                            />
                           </div>
                         );
                       })}
 
-                      {draggedEventForColumn && (
-                        <div
-                          className="pointer-events-none absolute left-2 right-2 z-30 overflow-hidden rounded-2xl border border-[#2563d8]/20 bg-[#2563d8]/20 px-3 py-2 text-left text-[#123a7a] shadow-[0_14px_30px_rgba(37,99,216,0.2)]"
-                          style={{
-                            top: getWeekEventLayout({
-                              ...draggedEventForColumn.event,
-                              startAt: draggedEventForColumn.currentStartAt,
-                              endAt: draggedEventForColumn.currentEndAt,
-                            }).top + 4,
-                            height: Math.max(
-                              getWeekEventLayout({
-                                ...draggedEventForColumn.event,
-                                startAt: draggedEventForColumn.currentStartAt,
-                                endAt: draggedEventForColumn.currentEndAt,
-                              }).height - 8,
-                              28,
-                            ),
-                          }}
-                        >
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#2563d8]">
-                            {formatTimeRange({
-                              ...draggedEventForColumn.event,
-                              startAt: draggedEventForColumn.currentStartAt,
-                              endAt: draggedEventForColumn.currentEndAt,
-                            })}
-                          </p>
-                          <p className="mt-1 truncate text-sm font-semibold">
-                            {draggedEventForColumn.event.title}
-                          </p>
-                          {draggedEventForColumn.event.location && (
-                            <p className="truncate text-xs text-[#123a7a]/70">
-                              {draggedEventForColumn.event.location}
-                            </p>
-                          )}
-                        </div>
-                      )}
+                      {draggedEventForColumn && (() => {
+                        const evt = {
+                          ...draggedEventForColumn.event,
+                          startAt: draggedEventForColumn.currentStartAt,
+                          endAt: draggedEventForColumn.currentEndAt,
+                        };
+                        return (
+                          <div
+                            className="pointer-events-none absolute left-2 right-2 z-30 touch-none shadow-[0_14px_30px_rgba(37,99,216,0.2)]"
+                            style={{
+                              top: getWeekEventLayout(evt).top + 4,
+                              height: Math.max(getWeekEventLayout(evt).height - 8, 28),
+                            }}
+                          >
+                            <EventCard
+                              id={evt.id}
+                              title={evt.title}
+                              startTime={formatTimeRange(evt).split(' - ')[0]}
+                              endTime={formatTimeRange(evt).split(' - ')[1] || ""}
+                              type={evt.title?.toLowerCase().includes('study') ? 'study' : (evt.title?.toLowerCase().includes('work') || evt.title?.toLowerCase().includes('sync') ? 'work' : (evt.title?.toLowerCase().includes('lunch') ? 'personal' : 'default'))}
+                              className="w-full h-full opacity-80 border-calm-primary/50"
+                            />
+                          </div>
+                        );
+                      })()}
 
                       {currentTimeLine && currentTimeLine.dayIndex === columnIndex && (
                         <div
                           className="pointer-events-none absolute left-0 right-0 z-20"
                           style={{ top: currentTimeLine.top }}
                         >
-                          <div className="absolute -left-2 top-[-6px] h-3 w-3 rounded-full bg-red-500" />
-                          <div className="h-[2px] bg-red-500" />
+                          <div className="absolute -left-2 top-[-6px] h-3 w-3 rounded-full bg-red-500/50" />
+                          <div className="h-[2px] bg-red-500/50" />
                         </div>
                       )}
                     </div>
@@ -1346,13 +1395,13 @@ export function ScheduleWorkspace({
             </div>
           </div>
         ) : (
-          <div className="flex-1 overflow-hidden bg-white/78">
-            <div className="h-full overflow-auto p-3 md:p-4">
-              <div className="grid min-w-[980px] grid-cols-7 overflow-hidden rounded-[1.6rem] border border-black/10 bg-white/85">
+          <div className="dashboard-month-view flex-1 overflow-hidden">
+            <div className="dashboard-calendar-scroll h-full overflow-auto p-3 md:p-4">
+              <div className="grid min-w-[980px] grid-cols-7 overflow-hidden rounded-[1.6rem] border border-[rgba(255,255,255,0.06)] bg-transparent">
                 {Array.from({ length: 7 }, (_, index) => (
                   <div
                     key={`month-label-${index}`}
-                    className="border-b border-black/10 px-3 py-4 text-center text-sm font-semibold uppercase tracking-[0.18em] text-slate-500"
+                    className="border-b border-[rgba(255,255,255,0.06)] px-3 py-4 text-center text-sm font-semibold uppercase tracking-[0.18em] text-calm-muted opacity-80"
                   >
                     {weekdayFormatter.format(addDays(startOfWeek(new Date()), index))}
                   </div>
@@ -1376,23 +1425,21 @@ export function ScheduleWorkspace({
                       }}
                       role="button"
                       tabIndex={0}
-                      className={`relative min-h-[162px] cursor-pointer border-r border-t border-black/10 px-3 py-3 text-left align-top transition hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-[#2563d8]/20 ${
-                        inActiveMonth ? "bg-white/90" : "bg-slate-50/70"
-                      }`}
+                      className={`relative min-h-[162px] cursor-pointer border-r border-t border-[rgba(255,255,255,0.06)] px-3 py-3 text-left align-top transition hover:bg-[rgba(255,255,255,0.02)] focus:outline-none focus:ring-2 focus:ring-[#2563d8]/20 ${inActiveMonth ? "bg-transparent text-white" : "bg-transparent"
+                        }`}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span
-                          className={`flex h-10 w-10 items-center justify-center rounded-full text-lg font-medium ${
-                            isToday
-                              ? "bg-[#2563d8] text-white"
-                              : inActiveMonth
-                                ? "text-ink"
-                                : "text-slate-400"
-                          }`}
+                          className={`flex h-10 w-10 items-center justify-center rounded-full text-lg font-medium ${isToday
+                            ? "bg-[#2563d8] text-white"
+                            : inActiveMonth
+                              ? "text-white"
+                              : "text-calm-muted opacity-70"
+                            }`}
                         >
                           {dayNumberFormatter.format(day)}
                         </span>
-                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">
+                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-calm-muted opacity-70">
                           {longWeekdayFormatter.format(day)}
                         </span>
                       </div>
@@ -1401,11 +1448,10 @@ export function ScheduleWorkspace({
                         {dayEvents.slice(0, 4).map((event) => (
                           <div
                             key={event.id}
-                            className={`rounded-xl px-2.5 py-2 text-xs ${
-                              isPastEvent(event)
-                                ? "bg-slate-100/70 text-slate-400"
-                                : "bg-slate-100 text-slate-700"
-                            }`}
+                            className={`rounded-xl px-2.5 py-2 text-xs ${isPastEvent(event)
+                              ? "bg-[rgba(255,255,255,0.05)]/70 text-calm-muted opacity-70"
+                              : "bg-[rgba(255,255,255,0.05)] text-calm-text"
+                              }`}
                           >
                             <button
                               type="button"
@@ -1415,10 +1461,10 @@ export function ScheduleWorkspace({
                               }}
                               className="w-full text-left"
                             >
-                              <p className={`truncate font-semibold ${isPastEvent(event) ? "text-slate-400 line-through" : "text-ink"}`}>
+                              <p className={`whitespace-normal break-words font-semibold ${isPastEvent(event) ? "text-calm-muted opacity-70 line-through" : "text-white"}`}>
                                 {event.title}
                               </p>
-                              <p className={`mt-1 truncate text-[11px] uppercase tracking-[0.14em] ${isPastEvent(event) ? "text-slate-400 line-through" : "text-slate-500"}`}>
+                              <p className={`mt-1 whitespace-normal break-words text-[11px] uppercase tracking-[0.14em] ${isPastEvent(event) ? "text-calm-muted opacity-70 line-through" : "text-calm-muted opacity-80"}`}>
                                 {formatTimeRange(event)}
                               </p>
                             </button>
@@ -1426,7 +1472,7 @@ export function ScheduleWorkspace({
                         ))}
 
                         {dayEvents.length > 4 && (
-                          <div className="text-xs font-medium text-slate-500">
+                          <div className="text-xs font-medium text-calm-muted opacity-80">
                             +{dayEvents.length - 4} more
                           </div>
                         )}

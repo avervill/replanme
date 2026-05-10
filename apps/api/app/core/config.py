@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     # ----- Auth / Security -----
     secret_key: str = secrets.token_urlsafe(32)
     access_token_expire_minutes: int = 60 * 24  # 24 hours
+    admin_secret: str = ""
+    admin_emails: str = ""
 
     # ----- Frontend -----
     frontend_url: str = "http://localhost:3000"
@@ -54,9 +56,36 @@ class Settings(BaseSettings):
     # ----- OpenAI -----
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    intent_model: str = "gpt-5.4-nano"
+    extraction_model: str = "gpt-5.4-nano"
+    simple_chat_model: str = "gpt-5.4-nano"
+    simple_action_model: str = "gpt-5.4-nano"
+    default_planner_model: str = "gpt-5.4-mini"
+    hard_planner_model: str = "gpt-5.4"
+    deep_planner_model: str = "gpt-5.5"
+    validator_model: str = "gpt-5.4-nano"
+    repair_model: str = "gpt-5.4-mini"
+    critic_model: str = "gpt-5.4-nano"
+    critic_model_hard: str = "gpt-5.4-mini"
+    nano_max_input_tokens: int = 3000
+    nano_max_output_tokens: int = 500
+    planner_max_input_tokens: int = 8000
+    planner_max_output_tokens: int = 1500
+    hard_planner_max_input_tokens: int = 12000
+    hard_planner_max_output_tokens: int = 2500
+    deep_planner_max_input_tokens: int = 16000
+    deep_planner_max_output_tokens: int = 3000
+    planner_default_threshold: int = 5
+    planner_hard_threshold: int = 10
+    enable_deep_planning: bool = False
+    enable_ai_cost_logging: bool = True
+    max_plan_repair_attempts: int = 2
+    min_critic_approval_score: float = 7.0
+    max_study_hours_per_day: float = 8.0
     whisper_model: str = "gpt-4o-mini-transcribe"
-    google_ai_api_key: str = ""
-    gemma_model: str = "gemma-3-27b-it"
+    assistant_pending_plan_ttl_seconds: int = 60 * 30
+    assistant_conversation_ttl_seconds: int = 60 * 60 * 12
+    assistant_retry_attempts: int = 3
 
     # ----- Google OAuth -----
     google_client_id: str = ""
@@ -96,6 +125,10 @@ class Settings(BaseSettings):
         if not self.google_redirect_uri:
             missing.append("GOOGLE_REDIRECT_URI")
         return missing
+
+    @property
+    def admin_email_set(self) -> set[str]:
+        return {email.strip().casefold() for email in self.admin_emails.split(",") if email.strip()}
 
 
 settings = Settings()

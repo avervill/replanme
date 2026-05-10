@@ -1,70 +1,106 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
-import {
-  ApiError,
-  createEventFromPrompt,
-  type PlannerAction,
-} from "@/lib/api";
+import { KeyboardEvent, useEffect, useRef, useState, FormEvent } from "react";
+import { isPaywallError, sendAssistantMessage, fetchChatHistory, clearChatHistory, type AssistantResponse, type PaywallPayload } from "@/lib/api";
+import { ensureStringMessage } from "@/lib/assistant-message";
+import { useAuth } from "@/lib/auth";
 import type { CalendarView } from "@/components/schedule-workspace";
 
 type AiChatPanelProps = {
   timeframe: CalendarView;
+  onCollapse?: () => void;
   onCalendarChanged?: () => void;
+  onPaywall?: (payload: PaywallPayload) => void;
 };
 
 type ChatMessage = {
   id: number;
   role: "assistant" | "user";
   text: string;
-  actions?: PlannerAction[];
-  pending?: boolean;
+  actions?: Array<{ kind: string; summary: string }>;
+  pendingText?: string; // e.g. "Thinking...", "Planning your week..."
+  awaitingConfirmation?: boolean;
+  confirmationToken?: string | null;
 };
+
+const SESSION_STORAGE_KEY = "replanme_assistant_session";
 
 const starterMessage: ChatMessage = {
   id: 1,
   role: "assistant",
-  text: "Tell me what to add to your calendar. Example: Meeting with Sarah tomorrow at 14:00 for 45 minutes.",
+  text: "Tell me what you want to plan for this week.",
 };
 
-export function AiChatPanel({ timeframe, onCalendarChanged }: AiChatPanelProps) {
+const getPendingText = (input: string) => {
+  const lower = input.toLowerCase();
+  if (lower.includes("conflict") || lower.includes("overlap") || lower.includes("fix")) {
+    return "Resolving conflicts...";
+  }
+  if (lower.includes("plan") || lower.includes("week")) {
+    return "Planning your week...";
+  }
+  return "Thinking...";
+};
+
+export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywall }: AiChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([starterMessage]);
   const [input, setInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [sessionId, setSessionId] = useState("");
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  const { refresh } = useAuth();
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
+    let nextId = "";
+    const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (existing) {
+      nextId = existing;
+    } else {
+      nextId = crypto.randomUUID();
+      window.localStorage.setItem(SESSION_STORAGE_KEY, nextId);
     }
-    viewport.scrollTop = viewport.scrollHeight;
-  }, [messages]);
+    setSessionId(nextId);
+
+    setLoadingHistory(true);
+    fetchChatHistory(nextId)
+      .then((data) => {
+        if (data.messages && data.messages.length > 0) {
+          const historyMessages: ChatMessage[] = data.messages.map((m, index) => ({
+            id: index + 1000, // offset IDs to avoid conflict with starter message
+            role: m.role,
+            text: m.text,
+          }));
+          setMessages([starterMessage, ...historyMessages]);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to load chat history:", err);
+      })
+      .finally(() => {
+        setLoadingHistory(false);
+      });
+  }, []);
 
   useEffect(() => {
-    const textarea = inputRef.current;
-    if (!textarea) {
-      return;
+    if (viewportRef.current) {
+      viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-    textarea.style.height = "0px";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 140)}px`;
-  }, [input]);
+  }, [messages]);
 
-  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    const prompt = input.trim();
-    if (!prompt || submitting) {
-      return;
-    }
+  const sendPrompt = async (promptValue: string) => {
+    const prompt = promptValue.trim();
+    if (!prompt || submitting) return;
 
     const userMessage: ChatMessage = {
       id: Date.now(),
       role: "user",
       text: prompt,
     };
+
     const pendingMessageId = Date.now() + 1;
+    const pendingText = getPendingText(prompt);
 
     setMessages((current) => [
       ...current,
@@ -72,8 +108,8 @@ export function AiChatPanel({ timeframe, onCalendarChanged }: AiChatPanelProps) 
       {
         id: pendingMessageId,
         role: "assistant",
-        text: "Extracting the event and adding it to Google Calendar...",
-        pending: true,
+        text: "",
+        pendingText,
       },
     ]);
     setInput("");
@@ -81,161 +117,247 @@ export function AiChatPanel({ timeframe, onCalendarChanged }: AiChatPanelProps) 
 
     try {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-      const response = await createEventFromPrompt({
+      const activeSessionId = sessionId || crypto.randomUUID();
+
+      const response = await sendAssistantMessage({
         prompt,
         timezone,
+        session_id: activeSessionId,
+        preview: false,
       });
 
-      if (response.created) {
+      if (response.status === "completed") {
         onCalendarChanged?.();
+      }
+      if (response.status !== "failed") {
+        void refresh();
       }
 
       setMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId
+        current.map((msg) =>
+          msg.id === pendingMessageId
             ? {
-                ...message,
-                text: response.message,
-                actions: response.created
-                  ? (response.events.length > 0 ? response.events : response.event ? [response.event] : []).map(
-                      (event) => ({
-                        kind: "create_event",
-                        summary: `${event.title} was added to Google Calendar.`,
-                      }),
-                    )
-                  : [
-                      {
-                        kind: "ask_user",
-                        summary: response.message,
-                      },
-                    ],
-                pending: false,
-              }
-            : message,
-        ),
+              ...msg,
+              text: ensureStringMessage(response.reply),
+              pendingText: undefined,
+              actions: response.display_actions.length > 0
+                ? response.display_actions.map((action) => ({
+                  kind: ensureStringMessage(action.kind),
+                  summary: ensureStringMessage(action.summary),
+                }))
+                : undefined,
+              awaitingConfirmation: response.awaiting_confirmation,
+              confirmationToken: response.confirmation_token,
+            }
+            : msg
+        )
       );
     } catch (error: unknown) {
-      const text =
-        error instanceof ApiError || error instanceof Error
-          ? error.message
-          : "The planning assistant could not respond.";
-
+      if (isPaywallError(error)) {
+        onPaywall?.(error.payload);
+      }
       setMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId
+        current.map((msg) =>
+          msg.id === pendingMessageId
             ? {
-                ...message,
-                text,
-                pending: false,
-              }
-            : message,
-        ),
+              ...msg,
+              text: isPaywallError(error)
+                ? error.payload.message
+                : error instanceof Error
+                  ? error.message
+                  : "I couldn't process that.",
+              pendingText: undefined,
+            }
+            : msg
+        )
       );
     } finally {
       setSubmitting(false);
     }
   };
 
+  const handleConfirmation = async (messageId: number) => {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const confirmationToken = messages.find((msg) => msg.id === messageId)?.confirmationToken ?? null;
+    setMessages((current) =>
+      current.map((msg) =>
+        msg.id === messageId
+          ? { ...msg, pendingText: "Executing changes...", awaitingConfirmation: false }
+          : msg
+      )
+    );
+
+    try {
+      const response = await sendAssistantMessage({
+        prompt: "yes",
+        timezone,
+        session_id: sessionId,
+        preview: false,
+        confirm: Boolean(confirmationToken),
+        confirmation_token: confirmationToken,
+      });
+
+      if (response.status === "completed") {
+        onCalendarChanged?.();
+      }
+      if (response.status !== "failed") {
+        void refresh();
+      }
+
+      setMessages((current) =>
+        current.map((msg) =>
+          msg.id === messageId
+            ? {
+              ...msg,
+              text: ensureStringMessage(response.reply),
+              pendingText: undefined,
+              awaitingConfirmation: response.awaiting_confirmation,
+              confirmationToken: response.confirmation_token,
+            }
+            : msg
+        )
+      );
+    } catch (error) {
+      if (isPaywallError(error)) {
+        onPaywall?.(error.payload);
+      }
+      setMessages((current) =>
+        current.map((msg) =>
+          msg.id === messageId
+            ? {
+              ...msg,
+              text: isPaywallError(error) ? error.payload.message : "Failed to confirm changes.",
+              pendingText: undefined
+            }
+            : msg
+        )
+      );
+    }
+  };
+
+  const handlePromptKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  };
+
+  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await sendPrompt(input);
+  };
+
   return (
-    <aside className="glass-panel self-start bg-white/88 xl:sticky xl:top-[5rem] xl:h-[calc(100vh-6rem)] xl:max-h-[calc(100vh-6rem)] flex min-h-[720px] flex-col overflow-hidden rounded-[2.25rem]">
-      <div className="border-b border-black/5 px-6 py-6 md:px-7">
-        <h2 className="display-font text-[2.25rem] font-semibold leading-none text-ink">
-          AI assistant
-        </h2>
+    <aside className="dashboard-chat-panel">
+      <div className="dashboard-chat-header">
+        <div className="flex-1">
+          <span className="mini-label">AI assistant</span>
+          <h2>Planner chat</h2>
+          <p>Ask anything to manage your schedule</p>
+        </div>
+        <div className="flex items-center gap-4">
+          <button
+            type="button"
+            onClick={async () => {
+              if (!sessionId) return;
+              try {
+                await clearChatHistory(sessionId);
+                setMessages([starterMessage]);
+              } catch (e) {
+                console.error("Failed to clear chat", e);
+              }
+            }}
+            className="text-xs text-zinc-500 hover:text-red-400 transition-colors"
+            title="Clear chat and restart session"
+          >
+            Clear
+          </button>
+          <button type="button" onClick={onCollapse} className="dashboard-chat-collapse" aria-label="Collapse AI chat">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 12H5" />
+            </svg>
+          </button>
+        </div>
       </div>
 
-      <div ref={viewportRef} className="flex-1 space-y-3 overflow-y-auto bg-white/78 px-5 py-5 md:px-6">
-        {messages.map((message) => (
+      <div ref={viewportRef} className="dashboard-chat-messages">
+        {loadingHistory && (
+          <div className="flex justify-center p-6 w-full">
+            <span className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent opacity-50 block mx-auto"></span>
+          </div>
+        )}
+        {!loadingHistory && messages.map((message) => (
           <div
             key={message.id}
-            className={`rounded-[1.35rem] px-4 py-3 text-sm leading-6 ${
-              message.role === "assistant"
-                ? "mr-4 bg-white text-slate-700 shadow-[0_14px_28px_rgba(17,33,45,0.06)]"
-                : "ml-8 bg-ink text-white"
-            }`}
+            className={`flex flex-col ${message.role === "assistant" ? "items-start pr-10" : "items-end pl-10"
+              }`}
           >
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-[10px] font-bold uppercase tracking-[0.24em] opacity-55">
-                {message.role}
-              </span>
-              {message.pending && (
-                <span className="text-[10px] font-bold uppercase tracking-[0.2em] opacity-45">
-                  working
-                </span>
+            <div
+              className={`dashboard-message-bubble ${message.role === "assistant"
+                ? "assistant"
+                : "user"
+                }`}
+            >
+              {message.pendingText ? (
+                <div className="flex items-center gap-2 opacity-75">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current"></span>
+                  <span className="italic">{message.pendingText}</span>
+                </div>
+              ) : (
+                <p className="whitespace-pre-wrap">{message.text}</p>
               )}
             </div>
 
-            <p className="mt-2 whitespace-pre-wrap">{message.text}</p>
-
-            {message.actions && message.actions.length > 0 && (
-              <div className="mt-4 space-y-2">
-                {message.actions.map((action, actionIndex) => (
-                  <div
-                    key={`${message.id}-${action.kind}-${actionIndex}`}
-                    className="rounded-2xl border border-black/5 bg-slate-50 px-3 py-3 text-slate-700"
-                  >
-                    <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500">
-                      {action.kind.replaceAll("_", " ")}
+            {message.actions && message.actions.length > 0 && !message.pendingText && (
+              <div className="mt-2 w-full space-y-2 pl-2">
+                {message.actions.map((action, idx) => (
+                  <div key={idx} className="dashboard-action-chip">
+                    <p>
+                      {action.kind.replace(/_/g, " ")}
                     </p>
-                    <p className="mt-1 text-sm leading-6">{action.summary}</p>
+                    <span>{action.summary}</span>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {message.awaitingConfirmation && !message.pendingText && (
+              <div className="mt-3 pl-2">
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmation(message.id)}
+                  className="dashboard-apply-button"
+                >
+                  Apply changes
+                </button>
               </div>
             )}
           </div>
         ))}
       </div>
 
-      <form onSubmit={onSubmit} className="border-t border-black/5 bg-white/88 p-4 md:p-5">
-        <label htmlFor="planner-prompt" className="sr-only">
-          Ask the planning assistant
-        </label>
-        <div className="flex items-end gap-2 rounded-[1.75rem] border border-black/10 bg-white px-3 py-3 transition focus-within:border-ember">
-          <button
-            type="button"
-            aria-label="Attach file"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 text-lg font-semibold text-slate-600 transition hover:bg-slate-200"
-          >
-            +
-          </button>
+      <form onSubmit={onSubmit} className="dashboard-chat-form">
+        <label htmlFor="planner-prompt" className="sr-only">Message the AI assistant</label>
+        <div className="dashboard-input-shell">
           <textarea
             ref={inputRef}
             id="planner-prompt"
             value={input}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handlePromptKeyDown}
             rows={1}
-            placeholder={`Example: Add a ${timeframe} planning meeting tomorrow at 10:00 for 45 minutes.`}
-            className="max-h-[140px] min-h-9 flex-1 resize-none bg-transparent px-1 py-2 text-sm leading-5 text-slate-700 outline-none"
+            placeholder="E.g., Move tomorrow's sync to Thursday..."
+            className="dashboard-chat-input"
           />
           <button
-            type="button"
-            aria-label="Voice input"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 text-slate-600 transition hover:bg-slate-200"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path
-                d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-              />
-              <path
-                d="M19 11a7 7 0 0 1-14 0M12 18v4M8 22h8"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-        </div>
-
-        <div className="mt-3 flex items-center justify-between gap-3">
-          <button
             type="submit"
-            disabled={submitting}
-            className="ml-auto rounded-full bg-ink px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-wait disabled:bg-slate-500"
+            disabled={submitting || !input.trim()}
+            className="dashboard-send-button"
+            aria-label="Send message"
           >
-            {submitting ? "Sending..." : "Send"}
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14m-7-7 7 7-7 7" />
+            </svg>
           </button>
         </div>
       </form>

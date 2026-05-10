@@ -20,6 +20,7 @@ from app.schemas.calendar import (
 from app.services.google_calendar import (
     create_google_event,
     delete_google_event,
+    get_google_event,
     list_google_events,
     update_google_event,
 )
@@ -148,11 +149,21 @@ async def update_event(
         }
     if payload.location is not None:
         event_body["location"] = payload.location
+    if payload.reminders is not None:
+        event_body["reminders"] = {
+            "useDefault": False,
+            "overrides": [
+                {"method": "popup", "minutes": minutes} for minutes in payload.reminders
+            ],
+        }
+    if payload.metadata is not None:
+        event_body["extendedProperties"] = {"private": payload.metadata}
 
     try:
-        result = await update_google_event(
+        await update_google_event(
             user.id, db, event_id=event_id, event_body=event_body
         )
+        result = await get_google_event(user.id, db, event_id=event_id)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)

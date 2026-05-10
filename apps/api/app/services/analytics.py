@@ -38,7 +38,7 @@ async def track_paywall_shown(
     await track_event(
         db,
         user_id,
-        "paywall_shown",
+        "paywall_viewed",
         {"reason": reason, **(metadata or {})},
         feature=feature,
     )
@@ -82,6 +82,26 @@ async def track_planning_request(
     return request
 
 
+async def log_planning_request(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID | None,
+    request_type: str | None = None,
+    prompt: str | None = None,
+    intent: str | None = None,
+    feature: str | None = None,
+    estimated_credits: int = 0,
+) -> PlanningRequest:
+    return await track_planning_request(
+        db,
+        user_id=user_id,
+        prompt=prompt,
+        intent=intent or request_type,
+        feature=feature,
+        estimated_credits=estimated_credits,
+    )
+
+
 async def update_planning_request(
     db: AsyncSession,
     request: PlanningRequest | None,
@@ -94,3 +114,18 @@ async def update_planning_request(
             setattr(request, key, value)
     db.add(request)
     await db.flush()
+
+
+async def update_planning_request_status(
+    db: AsyncSession,
+    request: PlanningRequest | None,
+    status: str,
+    **values: Any,
+) -> None:
+    await update_planning_request(db, request, status=status, **values)
+
+
+# Compatibility aliases matching the product analytics naming in docs.
+trackEvent = track_event
+logPlanningRequest = log_planning_request
+updatePlanningRequestStatus = update_planning_request_status

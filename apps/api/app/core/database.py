@@ -57,11 +57,12 @@ async def _ensure_billing_columns(connection) -> None:
         if connection.dialect.name == "postgresql"
         else "DATETIME"
     )
+    boolean_false = "false" if connection.dialect.name == "postgresql" else "0"
     columns = {
         "plan": "ALTER TABLE users ADD COLUMN plan VARCHAR(16) NOT NULL DEFAULT 'free'",
         "planning_credits": "ALTER TABLE users ADD COLUMN planning_credits INTEGER NOT NULL DEFAULT 0",
         "credits_last_refilled_at": f"ALTER TABLE users ADD COLUMN credits_last_refilled_at {period_end_type}",
-        "is_admin": "ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0",
+        "is_admin": f"ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT {boolean_false}",
         "subscription_status": (
             "ALTER TABLE users ADD COLUMN subscription_status "
             "VARCHAR(32) NOT NULL DEFAULT 'none'"

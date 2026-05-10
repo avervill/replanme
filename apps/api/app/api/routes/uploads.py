@@ -17,6 +17,7 @@ from app.core.security import get_current_user
 from app.models.user import User
 from app.schemas.uploads import UploadedFileResponse, UploadKind, VoiceTranscriptResponse
 from app.llm.openai_params import completion_token_param
+from app.services import analytics
 from app.services.subscriptions import FeatureName, commit_usage, refund_usage, reserve_usage
 
 router = APIRouter()
@@ -219,4 +220,12 @@ async def transcribe_voice_upload(
         await refund_usage(db, reservation)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No speech was detected.")
     await commit_usage(db, reservation)
+    await analytics.track_event(
+        db,
+        user.id,
+        "voice_prompt_used",
+        {"source": "voice_transcription", "filename": filename},
+        feature=FeatureName.VOICE_TO_CALENDAR,
+    )
+    await db.commit()
     return VoiceTranscriptResponse(transcript=transcript)

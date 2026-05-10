@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { trackOnboardingEvent } from "@/lib/api";
 
 type Step = "goals" | "productivity" | "weekly";
 
@@ -16,6 +17,10 @@ export default function OnboardingPage() {
     productivity: "",
     weeklyGoals: "",
   });
+
+  useEffect(() => {
+    void trackOnboardingEvent("onboarding_started").catch(() => undefined);
+  }, []);
 
   const goalOptions = [
     { value: "chaotic", label: "Chaotic schedule", description: "Too many meetings, no structure" },
@@ -56,6 +61,7 @@ export default function OnboardingPage() {
       };
       
       localStorage.setItem("onboarding", JSON.stringify(onboardingData));
+      await trackOnboardingEvent("onboarding_completed", onboardingData).catch(() => undefined);
       
       // TODO: Call AI to generate initial weekly plan
       // For now, just redirect to dashboard

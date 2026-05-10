@@ -24,6 +24,7 @@ from app.services.google_calendar import (
     list_google_events,
     update_google_event,
 )
+from app.services import analytics
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -107,6 +108,13 @@ async def create_event(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    await analytics.track_event(
+        db,
+        user.id,
+        "manual_calendar_event_created",
+        {"eventId": result.get("id"), "title": payload.title},
+    )
+    await db.commit()
 
     return GoogleCalendarEvent(
         id=result.get("id", ""),
@@ -168,6 +176,13 @@ async def update_event(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    await analytics.track_event(
+        db,
+        user.id,
+        "manual_calendar_event_updated",
+        {"eventId": event_id, "changedFields": sorted(event_body.keys())},
+    )
+    await db.commit()
 
     return GoogleCalendarEvent(
         id=result.get("id", ""),
@@ -198,3 +213,5 @@ async def remove_event(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         ) from exc
+    await analytics.track_event(db, user.id, "manual_calendar_event_deleted", {"eventId": event_id})
+    await db.commit()

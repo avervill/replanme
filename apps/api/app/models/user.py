@@ -17,7 +17,7 @@ class User(TimestampMixin, Base):
     plan: Mapped[str] = mapped_column(String(16), default="free", server_default="free", nullable=False)
     planning_credits: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     credits_last_refilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0", nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     subscription_status: Mapped[str] = mapped_column(
         String(32),
         default="none",

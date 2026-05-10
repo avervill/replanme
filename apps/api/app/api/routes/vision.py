@@ -11,6 +11,7 @@ from app.models.user import User
 from app.schemas.vision import ScheduleImportRequest, ScheduleImportResponse, ImportedEventPreview
 from app.schemas.assistant import AssistantMessageRequest
 from app.services.assistant import build_assistant_orchestrator
+from app.services import analytics
 from app.services.subscriptions import (
     FeatureName,
     commit_usage,
@@ -50,6 +51,14 @@ async def import_preview(
         await refund_usage(db, reservation)
     else:
         await commit_usage(db, reservation)
+        await analytics.track_event(
+            db,
+            user.id,
+            "image_uploaded_to_calendar",
+            {"source": "raw_text" if payload.raw_text else "image_url"},
+            feature=FeatureName.IMAGE_TO_CALENDAR,
+        )
+        await db.commit()
     
     events = []
     # If agent responded back with created_events memory or tools log, we extract it.

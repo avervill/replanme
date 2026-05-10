@@ -483,9 +483,47 @@ export interface AdminUserSummary {
   isAdmin: boolean;
   subscriptionStatus: string;
   hasGoogleCalendar: boolean;
+  active: boolean;
   totalPlanningRequests: number;
   totalCreditsUsed: number;
   createdAt: string;
+}
+
+export interface AdminUsersResponse {
+  items: AdminUserSummary[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface AdminOverview {
+  totalUsers: number;
+  newUsersToday: number;
+  newUsersLast7Days: number;
+  activeUsersToday: number;
+  activeUsersLast7Days: number;
+  totalPlanningRequests: number;
+  successfulPlanningRequests: number;
+  failedPlanningRequests: number;
+  totalCreditsUsed: number;
+  totalCreditsGranted: number;
+  googleCalendarConnectedUsers: number;
+  paywallViews: number;
+  upgradeClicks: number;
+}
+
+export interface AdminTimeseriesDay {
+  date: string;
+  signups: number;
+  planningRequests: number;
+  creditsUsed: number;
+  successfulPlanningRequests: number;
+  failedPlanningRequests: number;
+}
+
+export interface AdminTimeseries {
+  range: "14d" | "30d";
+  days: AdminTimeseriesDay[];
 }
 
 export interface AdminCreditTransaction {
@@ -494,6 +532,7 @@ export interface AdminCreditTransaction {
   balanceBefore: number;
   balanceAfter: number;
   type: string;
+  normalizedType?: string;
   reason: string;
   feature: string | null;
   relatedPlanningRequestId: string | null;
@@ -519,6 +558,13 @@ export interface AdminPlanningRequest {
 export interface AdminUserDetail extends AdminUserSummary {
   creditTransactions: AdminCreditTransaction[];
   planningRequests: AdminPlanningRequest[];
+  analyticsEvents?: Array<{
+    id: string;
+    eventName: string;
+    feature: string | null;
+    metadata: Record<string, unknown> | null;
+    createdAt: string;
+  }>;
   paywallEvents?: Array<{
     id: string;
     eventName: string;
@@ -528,8 +574,35 @@ export interface AdminUserDetail extends AdminUserSummary {
   }>;
 }
 
-export async function fetchAdminUsers(): Promise<AdminUserSummary[]> {
-  return apiGet<AdminUserSummary[]>("/admin/users");
+export interface AdminUsersParams {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  sort?: "createdAt" | "credits" | "email";
+  admin?: boolean;
+  googleConnected?: boolean;
+  active?: boolean;
+}
+
+function queryString(params: object): string {
+  const query = new URLSearchParams();
+  Object.entries(params as Record<string, string | number | boolean | undefined>).forEach(([key, value]) => {
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  });
+  const value = query.toString();
+  return value ? `?${value}` : "";
+}
+
+export async function fetchAdminOverview(): Promise<AdminOverview> {
+  return apiGet<AdminOverview>("/admin/analytics/overview");
+}
+
+export async function fetchAdminTimeseries(range: "14d" | "30d" = "30d"): Promise<AdminTimeseries> {
+  return apiGet<AdminTimeseries>(`/admin/analytics/timeseries${queryString({ range })}`);
+}
+
+export async function fetchAdminUsers(params: AdminUsersParams = {}): Promise<AdminUsersResponse> {
+  return apiGet<AdminUsersResponse>(`/admin/users${queryString(params)}`);
 }
 
 export async function fetchAdminUser(userId: string): Promise<AdminUserDetail> {
@@ -546,6 +619,14 @@ export async function adminAdjustCredits(userId: string, amount: number, reason:
 
 export async function adminSetPlan(userId: string, plan: "free" | "pro" | "admin"): Promise<{ ok: boolean; plan: string; subscriptionStatus: string }> {
   return apiPost<{ ok: boolean; plan: string; subscriptionStatus: string }>(`/admin/users/${userId}/plan`, { plan });
+}
+
+export async function trackUpgradeClicked(source: string): Promise<{ ok: boolean }> {
+  return apiPost<{ ok: boolean }>("/subscription/upgrade-clicked", { source });
+}
+
+export async function trackOnboardingEvent(eventName: "onboarding_started" | "onboarding_completed", metadata?: Record<string, unknown>): Promise<{ ok: boolean }> {
+  return apiPost<{ ok: boolean }>("/subscription/onboarding-event", { eventName, metadata });
 }
 
 export async function planSchedule(input: {

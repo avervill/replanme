@@ -54,6 +54,32 @@ DAY_NAMES = {
     "saturday": 5,
     "sunday": 6,
 }
+MONTH_NAMES = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
 CREATE_VERB_PATTERN = r"\b(add|create|schedule|sched|book|set\s+up|setup|put|make)\b"
 CREATE_VERB_PREFIX_PATTERN = r"^\s*(add|create|schedule|sched|book|set\s+up|setup|put|make)\s+"
 WEEKDAY_ALIASES = {
@@ -225,6 +251,8 @@ def _classify_prompt_intent(prompt: str, attachments: list[dict[str, Any]]) -> s
         return "image"
     if re.search(CREATE_VERB_PATTERN, normalized):
         return "create"
+    if _looks_like_bare_event_create(prompt):
+        return "create"
     if _looks_like_conflict_resolution(prompt):
         return "conflict"
     if any(phrase in normalized for phrase in ("plan my", "plan the", "study plan", "exam", "finals", "burned out", "burnt out")):
@@ -388,6 +416,22 @@ def _friendly_tool_error(error: str, *, intent: str) -> str:
     return f"I couldn't complete that: {error}"
 
 
+def _strip_tool_json_from_reply(answer: str) -> str:
+    visible_lines: list[str] = []
+    for line in answer.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict) and "tool" in payload:
+                continue
+        visible_lines.append(line)
+    cleaned = "\n".join(visible_lines).strip()
+    return cleaned or "Done."
+
+
 def _is_use_previous_request_reply(prompt: str) -> bool:
     normalized = re.sub(r"[.!?\s]+$", "", prompt.strip().casefold())
     return normalized in {
@@ -429,6 +473,38 @@ def _latest_create_prompt_from_title_clarification(history: list[dict[str, Any]]
             and _title_from_simple_create(content, now)
         ):
             return content
+    return None
+
+
+def _latest_title_from_schedule_clarification(history: list[dict[str, Any]]) -> str | None:
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        match = re.search(
+            r"(?:when|which day|what time) should i schedule\s+(.+?)\??$",
+            content.strip(),
+            re.IGNORECASE,
+        )
+        if match:
+            title = " ".join(match.group(1).strip(" .?\"'").split())
+            return title[:120] or None
+    return None
+
+
+def _merge_schedule_clarification_reply(prompt: str, history: list[dict[str, Any]], now: datetime) -> str | None:
+    title = _latest_title_from_schedule_clarification(history)
+    if not title:
+        return None
+    extracted = _extract_simple_calendar_command(prompt, now)
+    if not extracted.date_value and not extracted.start_time:
+        return None
+    merged = f"schedule {title} {prompt}"
+    merged_extraction = _extract_simple_calendar_command(merged, now)
+    if merged_extraction.intent == "create_single_event" and not merged_extraction.missing_fields:
+        return merged
     return None
 
 
@@ -599,6 +675,25 @@ def _find_date_fragment(prompt: str, now: datetime) -> tuple[datetime, tuple[int
         except ValueError:
             return None
 
+    month_match = re.search(
+        r"\b("
+        + "|".join(sorted(MONTH_NAMES, key=len, reverse=True))
+        + r")\s+([0-3]?\d)(?:st|nd|rd|th)?(?:,\s*(20\d{2}))?\b",
+        prompt,
+        re.IGNORECASE,
+    )
+    if month_match:
+        month = MONTH_NAMES[month_match.group(1).casefold()]
+        day = int(month_match.group(2))
+        year = int(month_match.group(3) or now.year)
+        try:
+            parsed = now.replace(year=year, month=month, day=day)
+            if month_match.group(3) is None and parsed.date() < now.date():
+                parsed = parsed.replace(year=year + 1)
+            return parsed, month_match.span()
+        except ValueError:
+            return None
+
     for match in re.finditer(r"\b(next\s+)?([a-z]{3,10})\b", normalized):
         next_prefix, token = match.groups()
         day_name = _weekday_from_token(token)
@@ -704,6 +799,25 @@ def _find_date_expression(prompt: str, now: datetime) -> tuple[str, datetime, tu
             return iso_match.group(1), parsed, iso_match.span()
         except ValueError:
             return None
+    month_match = re.search(
+        r"\b("
+        + "|".join(sorted(MONTH_NAMES, key=len, reverse=True))
+        + r")\s+([0-3]?\d)(?:st|nd|rd|th)?(?:,\s*(20\d{2}))?\b",
+        prompt,
+        re.IGNORECASE,
+    )
+    if month_match:
+        month = MONTH_NAMES[month_match.group(1).casefold()]
+        day = int(month_match.group(2))
+        year = int(month_match.group(3) or now.year)
+        try:
+            parsed = now.replace(year=year, month=month, day=day)
+            if month_match.group(3) is None and parsed.date() < now.date():
+                parsed = parsed.replace(year=year + 1)
+            label = f"{month_match.group(1).casefold()} {day}"
+            return label, parsed, month_match.span()
+        except ValueError:
+            return None
     return None
 
 
@@ -717,9 +831,49 @@ def _intent_from_calendar_prompt(prompt: str) -> str:
         return "update_event"
     if re.search(CREATE_VERB_PATTERN, normalized):
         return "create_single_event"
+    if _looks_like_bare_event_create(prompt):
+        return "create_single_event"
     if any(term in normalized for term in ("plan my", "prepare for", "study plan", "finals", "exam")):
         return "generate_plan"
     return "simple_chat"
+
+
+def _looks_like_bare_event_create(prompt: str) -> bool:
+    normalized = prompt.strip().casefold()
+    if not normalized or "?" in normalized:
+        return False
+    if re.search(r"\b(what|when|where|who|why|how|show|list|find|do i|am i)\b", normalized):
+        return False
+    if re.search(r"\b(move|reschedule|delete|remove|clear|update|edit|rename|change)\b", normalized):
+        return False
+
+    time_fragment = _find_time_fragment(prompt)
+    if not time_fragment:
+        return False
+
+    date_spans: list[tuple[int, int]] = []
+    for match in re.finditer(r"\b(today|tomorrow|20\d{2}-\d{2}-\d{2})\b", prompt, re.IGNORECASE):
+        date_spans.append(match.span())
+    month_pattern = (
+        r"\b("
+        + "|".join(sorted(MONTH_NAMES, key=len, reverse=True))
+        + r")\s+([0-3]?\d)(?:st|nd|rd|th)?(?:,\s*(20\d{2}))?\b"
+    )
+    for match in re.finditer(month_pattern, prompt, re.IGNORECASE):
+        date_spans.append(match.span())
+    for match in re.finditer(r"\b(?:(?:this|next|on)\s+)?([a-z]{3,10})\b", prompt, re.IGNORECASE):
+        if _weekday_from_token(match.group(1)):
+            date_spans.append(match.span())
+
+    if not date_spans:
+        return False
+
+    title = _clean_extracted_title(
+        prompt,
+        intent="create_single_event",
+        spans_to_remove=[time_fragment[2], *date_spans],
+    )
+    return bool(title and len(title.split()) <= 18)
 
 
 def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
@@ -738,6 +892,7 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
 def _clean_extracted_title(prompt: str, *, intent: str, spans_to_remove: list[tuple[int, int]]) -> str | None:
     title = _remove_spans(prompt, spans_to_remove)
     title = re.sub(CREATE_VERB_PREFIX_PATTERN, "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*back\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"^\s*(move|reschedule|delete|remove|clear|update|edit|rename|change)\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:from|to|until|at|on|for|this|next)\s*$", " ", title, flags=re.IGNORECASE)
     title = re.sub(r"\bfor\s+\d+(?:\.\d+)?\s*(hours?|hrs?|h|minutes?|mins?|m)\b", " ", title, flags=re.IGNORECASE)
@@ -1509,6 +1664,22 @@ class PlannerAgent:
             return pending_response
 
         if not payload.attachments and not payload.dry_run and not payload.preview:
+            merged_create_prompt = _merge_schedule_clarification_reply(payload.prompt, history, now_local)
+            if merged_create_prompt:
+                simple_response = await self._try_simple_create(
+                    prompt=merged_create_prompt,
+                    session_id=session_id,
+                    timezone_str=timezone_str,
+                    now_local=now_local,
+                    user=user,
+                    db=db,
+                    memory_response=memory_response,
+                    memory_handler=memory_handler,
+                    history_message=payload.prompt,
+                )
+                if simple_response:
+                    return simple_response
+
             if _is_use_previous_request_reply(payload.prompt):
                 previous_create_prompt = _latest_create_prompt_from_title_clarification(history, now_local)
                 if previous_create_prompt:
@@ -1639,7 +1810,7 @@ class PlannerAgent:
             messages.append(msg_dict)
             
             if not message.tool_calls:
-                answer = message.content or "I have processed your request."
+                answer = _strip_tool_json_from_reply(message.content or "I have processed your request.")
                 if _looks_like_existing_event_claim(answer) and not current_turn_calendar_truth:
                     messages.append({
                         "role": "system",

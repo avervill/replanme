@@ -6,10 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm.agent import (
+    _classify_prompt_intent,
     _date_from_prompt,
     _extract_simple_calendar_command,
     _latest_create_prompt_from_title_clarification,
+    _merge_schedule_clarification_reply,
     _parse_time_fragment,
+    _strip_tool_json_from_reply,
     _title_from_simple_create,
 )
 from app.llm.tools import execute_tool_call
@@ -224,6 +227,56 @@ def test_structured_extraction_parses_single_start_time_with_default_duration():
     assert result.end_time is None
     assert result.duration_minutes == 60
     assert result.missing_fields == []
+
+
+def test_structured_extraction_treats_bare_title_day_time_as_create():
+    now = datetime(2026, 5, 13, 12, tzinfo=UTC)
+    result = _extract_simple_calendar_command("ml final project defence wednesday 14:20", now)
+
+    assert _classify_prompt_intent("ml final project defence wednesday 14:20", []) == "create"
+    assert result.intent == "create_single_event"
+    assert result.title == "ml final project defence"
+    assert result.date == "wednesday"
+    assert result.start_time == "14:20"
+    assert result.missing_fields == []
+
+
+def test_structured_extraction_parses_month_day_follow_up_and_back_title():
+    now = datetime(2026, 5, 13, 12, tzinfo=UTC)
+    result = _extract_simple_calendar_command("sched back ml final project defence to may 13 14:20", now)
+
+    assert _classify_prompt_intent("ml final project defence may 13 14:20", []) == "create"
+    assert result.intent == "create_single_event"
+    assert result.title == "ml final project defence"
+    assert result.date == "may 13"
+    assert result.date_value.date().isoformat() == "2026-05-13"
+    assert result.start_time == "14:20"
+    assert result.missing_fields == []
+
+
+def test_schedule_time_clarification_merges_previous_title():
+    now = datetime(2026, 5, 13, 12, tzinfo=UTC)
+    history = [
+        {"role": "user", "content": "sched back ml final project defence"},
+        {"role": "assistant", "content": "When should I schedule ml final project defence?"},
+    ]
+
+    merged = _merge_schedule_clarification_reply("to may 13 14:20", history, now)
+
+    assert merged == "schedule ml final project defence to may 13 14:20"
+    result = _extract_simple_calendar_command(merged, now)
+    assert result.title == "ml final project defence"
+    assert result.start_time == "14:20"
+    assert result.missing_fields == []
+
+
+def test_tool_json_is_removed_from_assistant_reply():
+    answer = (
+        '{"tool": "delete_event", "success": true, "events": ["evt | Title"]}\n\n'
+        'The event was deleted.'
+    )
+
+    assert _strip_tool_json_from_reply(answer) == "The event was deleted."
 
 
 def test_structured_extraction_parses_next_monday_24h_time():

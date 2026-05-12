@@ -1383,12 +1383,15 @@ tr:last-child td {
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 8px;
 }
 
 .dashboard-nav a,
 .dashboard-nav button {
+  display: inline-flex;
   min-height: 40px;
+  align-items: center;
+  justify-content: center;
   border: 1px solid transparent;
   border-radius: 13px;
   background: transparent;
@@ -1398,6 +1401,8 @@ tr:last-child td {
   font-size: 0.86rem;
   font-weight: 900;
   padding: 0 14px;
+  line-height: 1;
+  white-space: nowrap;
   transition: transform 180ms ease, background 180ms ease, color 180ms ease, border-color 180ms ease;
 }
 
@@ -1426,6 +1431,7 @@ tr:last-child td {
   display: inline-flex;
   min-height: 40px;
   align-items: center;
+  justify-content: center;
   gap: 7px;
   border: 1px solid rgba(20, 184, 166, 0.22);
   border-radius: 13px;
@@ -1434,6 +1440,8 @@ tr:last-child td {
   font-size: 0.84rem;
   font-weight: 900;
   padding: 0 12px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .credits-badge.low {

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { use, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   adminAdjustCredits,
   adminGrantCredits,
@@ -17,12 +18,14 @@ function transactionLabel(type: string, normalizedType?: string): string {
 
 export default function AdminUserPage({ params }: { params: Promise<{ userId: string }> }) {
   const { userId } = use(params);
-  const { user, loading } = useAuth();
+  const { user, loading, refresh } = useAuth();
+  const router = useRouter();
   const [detail, setDetail] = useState<AdminUserDetail | null>(null);
   const [amount, setAmount] = useState("5");
   const [reason, setReason] = useState("Manual admin credit change");
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [accessRefreshAttempted, setAccessRefreshAttempted] = useState(false);
 
   const reload = () => {
     fetchAdminUser(userId)
@@ -36,6 +39,21 @@ export default function AdminUserPage({ params }: { params: Promise<{ userId: st
   useEffect(() => {
     if (user?.is_admin) reload();
   }, [user?.is_admin, userId]);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!user) {
+      router.replace("/login");
+      return;
+    }
+    if (user.is_admin) return;
+    if (!accessRefreshAttempted) {
+      setAccessRefreshAttempted(true);
+      void refresh();
+      return;
+    }
+    router.replace("/dashboard");
+  }, [accessRefreshAttempted, loading, refresh, router, user]);
 
   if (loading || !user?.is_admin) {
     return <main className="landing-page flex min-h-screen items-center justify-center">Loading...</main>;

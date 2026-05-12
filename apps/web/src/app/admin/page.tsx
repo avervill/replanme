@@ -61,7 +61,7 @@ function MiniBars({ rows, metric, label }: { rows: AdminTimeseries["days"]; metr
 }
 
 export default function AdminPage() {
-  const { user, loading } = useAuth();
+  const { user, loading, refresh } = useAuth();
   const router = useRouter();
   const [overview, setOverview] = useState<AdminOverview | null>(null);
   const [timeseries, setTimeseries] = useState<AdminTimeseries | null>(null);
@@ -74,12 +74,23 @@ export default function AdminPage() {
   const [googleFilter, setGoogleFilter] = useState<FilterValue>("all");
   const [activeFilter, setActiveFilter] = useState<FilterValue>("all");
   const [error, setError] = useState<string | null>(null);
+  const [accessRefreshAttempted, setAccessRefreshAttempted] = useState(false);
   const pageSize = 25;
 
   useEffect(() => {
-    if (!loading && !user) router.replace("/login");
-    if (!loading && user && !user.is_admin) router.replace("/dashboard");
-  }, [loading, router, user]);
+    if (loading) return;
+    if (!user) {
+      router.replace("/login");
+      return;
+    }
+    if (user.is_admin) return;
+    if (!accessRefreshAttempted) {
+      setAccessRefreshAttempted(true);
+      void refresh();
+      return;
+    }
+    router.replace("/dashboard");
+  }, [accessRefreshAttempted, loading, refresh, router, user]);
 
   useEffect(() => {
     if (!user?.is_admin) return;

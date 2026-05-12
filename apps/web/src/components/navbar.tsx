@@ -32,8 +32,6 @@ export function Navbar({ onSettingsClick }: NavbarProps) {
                         <LowCreditsWarning credits={user.planning_credits} />
                     </>
                 )}
-                {user?.is_admin && <Link href="/admin">Admin</Link>}
-                <Link href="/">Main page</Link>
                 <button type="button" onClick={onSettingsClick}>Settings</button>
                 <Link href="/pricing" className="dashboard-pricing-link">Pricing</Link>
                 <button type="button" onClick={handleSignOut}>Sign out</button>

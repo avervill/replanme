@@ -44,6 +44,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def visible_chat_history_messages(stored_messages: list[dict]) -> list[dict[str, str]]:
+    """Return only user-visible chat turns, hiding internal tool traffic."""
+    messages: list[dict[str, str]] = []
+    for idx, msg in enumerate(stored_messages):
+        role = msg.get("role", "assistant")
+        content = msg.get("content", "")
+        if role not in {"user", "assistant"}:
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        messages.append({
+            "id": f"history-{idx}",
+            "role": role,
+            "text": content,
+        })
+    return messages
+
+
 async def get_assistant_service():
     return await build_assistant_orchestrator()
 
@@ -285,17 +305,7 @@ async def get_chat_history(
 ):
     """Retrieve stored chat messages for a given session."""
     state = await assistant.state_store.load(user_id=str(user.id), session_id=session_id)
-    messages = []
-    for idx, msg in enumerate(state.messages):
-        role = msg.get("role", "assistant")
-        content = msg.get("content", "")
-        if role == "system":
-            continue
-        messages.append({
-            "id": f"history-{idx}",
-            "role": role,
-            "text": content,
-        })
+    messages = visible_chat_history_messages(state.messages)
     planning_active = False
     plan_summary = None
     if state.planning_state:

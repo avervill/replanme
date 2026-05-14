@@ -1,0 +1,9 @@
+.venv
+.test-venv
+.pytest_cache
+__pycache__
+*.db
+*.log
+tmp
+reschedai_api.egg-info
+resched_me_api.egg-info

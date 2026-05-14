@@ -64,6 +64,15 @@ You can also run the whole stack with:
 docker compose up --build
 ```
 
+## Railway deployment
+
+The project is prepared for Railway as two services from this monorepo:
+
+- API service: `apps/api`
+- Web service: `apps/web`
+
+See [docs/railway-deploy.md](docs/railway-deploy.md) for root directory settings, required variables, healthchecks, and deployment order.
+
 ## Notes
 
 - The backend defaults to SQLite if `DATABASE_URL` is not set, but the intended production setup is Postgres.

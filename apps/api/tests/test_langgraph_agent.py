@@ -17,7 +17,7 @@ from app.schemas.assistant import (
     UserPlanningMemory,
 )
 from app.services.assistant import orchestrator as orchestrator_module
-from app.services.assistant.orchestrator import AssistantOrchestrator, _compact_tool_result
+from app.services.assistant.orchestrator import AssistantOrchestrator, _compact_tool_result, _tool_specs
 
 
 class FakeAIMessage:
@@ -119,14 +119,18 @@ class FakeMemoryService:
 class FakeRegistry:
     MUTATING_TOOLS = {"create_event", "move_event", "delete_event", "batch_move_events", "batch_delete_events"}
 
-    def __init__(self, *, fail_create=False):
+    def __init__(self, *, fail_create=False, duplicate_create=False):
         self.created = []
         self.fetch_count = 0
+        self.fetched_payloads = []
         self.fail_create = fail_create
+        self.duplicate_create = duplicate_create
 
     async def create_event(self, payload, *, user, db, memory):
         if self.fail_create:
             raise RuntimeError("calendar create failed")
+        if self.duplicate_create and not payload.dry_run and not payload.allow_duplicate:
+            raise ValueError("This looks like a duplicate of 'Gym Session' (evt-existing). Do you want to keep both?")
         event = CalendarEventSnapshot(
             id=f"evt-{len(self.created) + 1}",
             title=payload.title,
@@ -157,6 +161,7 @@ class FakeRegistry:
 
     async def fetch_events(self, payload, *, user, db, memory):
         self.fetch_count += 1
+        self.fetched_payloads.append(payload)
         return FetchEventsResult(
             success=True,
             metadata=ToolExecutionMetadata(tool="fetch_events", executed=True),
@@ -248,6 +253,71 @@ def test_calendar_tool_result_uses_compact_context():
     assert "{" not in content
 
 
+def test_create_event_tool_schema_keeps_title_property():
+    create_event_spec = next(spec for spec in _tool_specs(("create_event",)) if spec["function"]["name"] == "create_event")
+
+    assert "title" in create_event_spec["function"]["parameters"]["properties"]
+    assert "title" in create_event_spec["function"]["parameters"]["required"]
+
+
+def test_tool_datetime_args_without_offset_are_localized():
+    registry = FakeRegistry()
+    assistant = _assistant(registry)
+    state = {
+        "timezone": "Asia/Qyzylorda",
+        "user": _user(),
+        "db": None,
+        "memory": UserPlanningMemory(),
+    }
+
+    asyncio.run(
+        assistant._execute_tool(
+            state,
+            "fetch_events",
+            {
+                "start_at": "2026-05-15T09:00:00+05:00",
+                "end_at": "2026-05-15T18:00:00",
+            },
+            force_dry_run=False,
+        )
+    )
+
+    payload = registry.fetched_payloads[0]
+    assert payload.start_at.isoformat() == "2026-05-15T09:00:00+05:00"
+    assert payload.end_at.isoformat() == "2026-05-15T18:00:00+05:00"
+
+
+def test_missing_create_title_returns_tool_validation_error():
+    registry = FakeRegistry()
+    assistant = _assistant(registry)
+    state = {
+        "timezone": "UTC",
+        "route": orchestrator_module._initial_agent_route(),
+        "messages": [],
+        "user": _user(),
+        "db": None,
+        "memory": UserPlanningMemory(),
+        "loop_count": 0,
+    }
+    state["tool_calls"] = [
+        orchestrator_module.ToolCallPlan(
+            name="create_event",
+            args={
+                "start_at": "2026-05-15T18:00:00+00:00",
+                "end_at": "2026-05-15T19:00:00+00:00",
+                "timezone": "UTC",
+            },
+            id="missing-title",
+        )
+    ]
+
+    asyncio.run(assistant._tools_node(state))
+
+    assert state["tool_results"][0]["success"] is False
+    assert "missing required field(s): title" in state["tool_results"][0]["error"]
+    assert "validation_error" in state["messages"][-1]["content"]
+
+
 def test_single_create_executes_and_returns_created_event(monkeypatch):
     _install_fake_llm(monkeypatch)
     registry = FakeRegistry()
@@ -258,6 +328,32 @@ def test_single_create_executes_and_returns_created_event(monkeypatch):
     assert response.execution.created_events
     assert registry.created[0].title == "gym"
     assert FakeChatOpenAI.model_calls == ["gpt-4o-mini", "gpt-4o-mini"]
+
+
+def test_duplicate_create_returns_confirmation_and_applies_with_token(monkeypatch):
+    _install_fake_llm(monkeypatch)
+    registry = FakeRegistry(duplicate_create=True)
+    assistant = _assistant(registry)
+
+    draft = _run(assistant, "add gym tomorrow at 6pm", session_id="duplicate")
+
+    assert draft.status == "awaiting_confirmation"
+    assert draft.awaiting_confirmation is True
+    assert draft.confirmation_token
+    assert registry.created == []
+    assert "duplicate" in draft.execution.preview[0].details
+
+    confirmed = _run(
+        assistant,
+        "yes",
+        session_id="duplicate",
+        confirm=True,
+        confirmation_token=draft.confirmation_token,
+    )
+
+    assert confirmed.status == "completed"
+    assert registry.created
+    assert registry.created[0].title == "gym"
 
 
 def test_complex_plan_returns_confirmation_without_mutation(monkeypatch):

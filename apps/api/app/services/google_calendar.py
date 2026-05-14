@@ -20,6 +20,12 @@ GOOGLE_CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 
+def _rfc3339(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Token helpers
 # ---------------------------------------------------------------------------
@@ -151,8 +157,8 @@ async def list_google_events_in_range(
                 "maxResults": max_results,
                 "singleEvents": "true",
                 "orderBy": "startTime",
-                "timeMin": start_at.isoformat(),
-                "timeMax": end_at.isoformat(),
+                "timeMin": _rfc3339(start_at),
+                "timeMax": _rfc3339(end_at),
             },
         )
         resp.raise_for_status()

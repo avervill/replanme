@@ -266,7 +266,7 @@ class AssistantToolRegistry:
             ),
             None,
         )
-        if duplicate is not None:
+        if duplicate is not None and not payload.allow_duplicate:
             raise ValueError(
                 f"This looks like a duplicate of '{duplicate.title}' ({duplicate.id}). Do you want to keep both?"
             )

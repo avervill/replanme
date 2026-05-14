@@ -293,6 +293,7 @@ class ToolExecutionMetadata(StrictModel):
 class CreateEventInput(ProposedCalendarEvent):
     reminders: list[int] = Field(default_factory=lambda: [15])
     dry_run: bool = False
+    allow_duplicate: bool = False
 
 
 class CreateEventResult(StrictModel):

@@ -17,7 +17,7 @@ import zoneinfo
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -29,6 +29,7 @@ from app.schemas.assistant import (
     BatchMoveEventsInput,
     CalendarEventSnapshot,
     CreateEventInput,
+    CreateEventResult,
     DeleteEventInput,
     DetectConflictsInput,
     DisplayAction,
@@ -207,7 +208,7 @@ def _compact_schema(value: Any) -> Any:
         return {
             key: _compact_schema(item)
             for key, item in value.items()
-            if key not in {"title", "examples", "default"}
+            if key not in {"examples", "default"}
         }
     if isinstance(value, list):
         return [_compact_schema(item) for item in value]
@@ -409,8 +410,58 @@ def _compact_tool_result(value: Any, *, timezone: str, max_chars: int = 6000) ->
     return _json_summary(value, max_chars=max_chars)
 
 
+def _localize_naive_datetimes(value: Any, tzinfo: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=tzinfo) if value.tzinfo is None else value
+    if isinstance(value, BaseModel):
+        updates = {
+            name: _localize_naive_datetimes(getattr(value, name), tzinfo)
+            for name in value.__class__.model_fields
+        }
+        return value.model_copy(update=updates)
+    if isinstance(value, list):
+        return [_localize_naive_datetimes(item, tzinfo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_localize_naive_datetimes(item, tzinfo) for item in value)
+    if isinstance(value, dict):
+        return {key: _localize_naive_datetimes(item, tzinfo) for key, item in value.items()}
+    return value
+
+
+def _infer_tzinfo(value: Any) -> Any | None:
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.tzinfo
+    if isinstance(value, BaseModel):
+        for name in value.__class__.model_fields:
+            tzinfo = _infer_tzinfo(getattr(value, name))
+            if tzinfo is not None:
+                return tzinfo
+    if isinstance(value, dict):
+        for item in value.values():
+            tzinfo = _infer_tzinfo(item)
+            if tzinfo is not None:
+                return tzinfo
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            tzinfo = _infer_tzinfo(item)
+            if tzinfo is not None:
+                return tzinfo
+    return None
+
+
 def _result_success(value: Any) -> bool:
     return bool(getattr(value, "success", True))
+
+
+def _validation_error_message(tool_name: str, exc: ValidationError) -> str:
+    missing = [str(error["loc"][-1]) for error in exc.errors() if error.get("type") == "missing" and error.get("loc")]
+    if missing:
+        return f"validation_error: {tool_name} is missing required field(s): {', '.join(missing)}. Ask the user for the missing details before calling this tool again."
+    return f"validation_error: {tool_name} arguments are invalid: {exc}. Ask a clarification instead of retrying with guessed values."
+
+
+def _is_duplicate_create_error(tool_name: str, exc: Exception) -> bool:
+    return tool_name == "create_event" and "duplicate" in str(exc).casefold() and "keep both" in str(exc).casefold()
 
 
 def _preview_from_payload(value: Any) -> list[PlanPreviewChange]:
@@ -788,6 +839,52 @@ class AssistantOrchestrator:
                         "content": _compact_tool_result(result, timezone=state["timezone"]),
                     }
                 )
+            except ValidationError as exc:
+                error = _validation_error_message(call.name, exc)
+                logger.info("assistant.tool_validation_failed", extra={"tool": call.name, "error": error})
+                results.append({"tool": call.name, "error": error, "success": False})
+                state["messages"].append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id or f"tool-{call.name}",
+                        "name": call.name,
+                        "content": error,
+                    }
+                )
+            except ValueError as exc:
+                if _is_duplicate_create_error(call.name, exc):
+                    logger.info("assistant.duplicate_create_requires_confirmation", extra={"tool": call.name})
+                    result, pending_call = self._duplicate_create_confirmation(state, call, exc)
+                    state["planned_tool_calls"] = [pending_call]
+                    state["route"] = RouteDecision(
+                        intent="create_single_event",
+                        route="complex",
+                        selected_model=state["route"].selected_model,
+                        confidence=0.9,
+                        complexity_score=5.0,
+                        reason="Creating an exact duplicate needs explicit confirmation.",
+                        candidate_tools=["create_event"],
+                    )
+                    results.append({"tool": call.name, "result": result, "success": False})
+                    state["messages"].append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id or f"tool-{call.name}",
+                            "name": call.name,
+                            "content": _compact_tool_result(result, timezone=state["timezone"]),
+                        }
+                    )
+                    continue
+                logger.info("assistant.tool_rejected", extra={"tool": call.name, "error": str(exc)})
+                results.append({"tool": call.name, "error": str(exc), "success": False})
+                state["messages"].append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id or f"tool-{call.name}",
+                        "name": call.name,
+                        "content": json.dumps({"error": str(exc)}),
+                    }
+                )
             except Exception as exc:
                 logger.warning("assistant.tool_failed", exc_info=True)
                 results.append({"tool": call.name, "error": str(exc), "success": False})
@@ -951,6 +1048,7 @@ class AssistantOrchestrator:
             "Use calendar tools to inspect availability and draft changes. "
             "For every calendar mutation, call tools with dry_run=true; the backend will handle user confirmation before applying anything. "
             "Do not ask the user to confirm inside this model call. "
+            "If a tool returns validation_error or says a required field is missing, ask the user for that detail instead of retrying the same tool with guessed values. "
             f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
             f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
             f"{reason}"
@@ -970,6 +1068,11 @@ class AssistantOrchestrator:
             raise ValueError(f"Unknown tool: {tool_name}")
         if tool_name == "parse_schedule_image":
             return self._parse_schedule_image(tool_args, state["payload"].attachments)
+        validated = self._validate_tool_args(state, tool_name, tool_args, force_dry_run=force_dry_run)
+        handler = getattr(self.registry, tool_name)
+        return await handler(validated, user=state["user"], db=state.get("db"), memory=state["memory"])
+
+    def _validate_tool_args(self, state: AgentGraphState, tool_name: str, tool_args: dict[str, Any], *, force_dry_run: bool) -> BaseModel:
         model = TOOL_MODELS[tool_name]
         args = dict(tool_args)
         if "timezone" in model.model_fields and not args.get("timezone"):
@@ -977,8 +1080,40 @@ class AssistantOrchestrator:
         if force_dry_run and tool_name in MUTATING_TOOLS and "dry_run" in model.model_fields:
             args["dry_run"] = True
         validated = model.model_validate(args)
-        handler = getattr(self.registry, tool_name)
-        return await handler(validated, user=state["user"], db=state.get("db"), memory=state["memory"])
+        return _localize_naive_datetimes(validated, _infer_tzinfo(validated) or _safe_zoneinfo(state["timezone"]))
+
+    def _duplicate_create_confirmation(self, state: AgentGraphState, call: ToolCallPlan, exc: Exception) -> tuple[CreateEventResult, dict[str, Any]]:
+        payload = self._validate_tool_args(state, "create_event", call.args, force_dry_run=True)
+        assert isinstance(payload, CreateEventInput)
+        preview_event = CalendarEventSnapshot(
+            id="preview:create_event_duplicate",
+            title=payload.title,
+            description=payload.description,
+            start_at=payload.start_at,
+            end_at=payload.end_at,
+            timezone=payload.timezone,
+            location=payload.location,
+            status="preview",
+            html_link=None,
+        )
+        result = CreateEventResult(
+            success=True,
+            metadata=ToolExecutionMetadata(tool="create_event", executed=False, dry_run=True),
+            created_events=[preview_event],
+            preview=[
+                PlanPreviewChange(
+                    action="create_event",
+                    title=payload.title,
+                    details=str(exc),
+                    proposed_start_at=payload.start_at,
+                    proposed_end_at=payload.end_at,
+                )
+            ],
+        )
+        pending_args = payload.model_dump(mode="json")
+        pending_args["dry_run"] = False
+        pending_args["allow_duplicate"] = True
+        return result, ToolCallPlan(name="create_event", args=pending_args).model_dump(mode="json")
 
     def _parse_schedule_image(self, tool_args: dict[str, Any], attachments: list[dict[str, Any]]) -> ParseScheduleImageResult:
         requested_id = tool_args.get("attachment_id")
@@ -1168,6 +1303,8 @@ class AssistantOrchestrator:
             "or any request where deeper reasoning would make the result better. "
             "Safe single event creation and calendar search can be handled directly with tools. "
             "Never claim existing calendar events without calling a calendar read tool first. "
+            "If a tool returns validation_error or says a required field is missing, ask the user for that detail instead of retrying the same tool with guessed values. "
+            "If a tool reports a duplicate event, ask whether to keep both instead of retrying. "
             f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
             f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
         )

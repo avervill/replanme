@@ -6,11 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt ./
+COPY apps/api/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY alembic.ini ./
-COPY alembic ./alembic
-COPY app ./app
+COPY apps/api/alembic.ini ./
+COPY apps/api/alembic ./alembic
+COPY apps/api/app ./app
 
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

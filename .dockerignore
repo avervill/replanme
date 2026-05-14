@@ -1,0 +1,14 @@
+.git
+.env
+.env.local
+.env.*.local
+**/.next
+**/node_modules
+**/.pytest_cache
+**/.venv
+**/.test-venv
+**/__pycache__
+**/*.db
+**/*.log
+apps/api/tmp
+postgres-data

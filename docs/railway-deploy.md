@@ -5,7 +5,9 @@ This repo is a monorepo with two deployable Railway services:
 - `replanme-api` from `apps/api`
 - `replanme-web` from `apps/web`
 
-Railway's monorepo guide recommends setting a root directory per service. If you use config-as-code, point each service to the matching config file:
+Railway builds these Dockerfiles from the repository root context. Keep the service root directory empty unless you intentionally change the Dockerfiles back to subdirectory-relative paths.
+
+If you use config-as-code, point each service to the matching config file:
 
 - API config: `/apps/api/railway.toml`
 - Web config: `/apps/web/railway.toml`
@@ -19,16 +21,16 @@ Create these Railway services in one project:
 3. API service from the GitHub repo
 4. Web service from the same GitHub repo
 
-Set the API service root directory to:
+Set the API service Dockerfile path to:
 
 ```text
-apps/api
+apps/api/Dockerfile
 ```
 
-Set the Web service root directory to:
+Set the Web service Dockerfile path to:
 
 ```text
-apps/web
+apps/web/Dockerfile
 ```
 
 Both services use Dockerfiles. The API container starts Uvicorn and the app creates missing tables on startup through its existing `init_db()` path. The Web container builds Next.js and starts `next start`.
@@ -111,6 +113,6 @@ docker compose up --build
 For production-like container commands:
 
 ```powershell
-docker build -t replanme-api ./apps/api
-docker build -t replanme-web ./apps/web
+docker build -f apps/api/Dockerfile -t replanme-api .
+docker build -f apps/web/Dockerfile -t replanme-web .
 ```

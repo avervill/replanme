@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     # ----- OpenAI -----
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    gemma_ai_api_key: str = ""
+    gemma_model: str = "gemma-4-31b-it"
+    gemma_timeout_seconds: int = 60
+    gemma_retry_attempts: int = 2
     intent_model: str = "gpt-5.4-nano"
     extraction_model: str = "gpt-5.4-nano"
     simple_chat_model: str = "gpt-5.4-nano"

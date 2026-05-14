@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Any
 
+from app.core.config import settings
+from app.llm.gemma import GemmaClient
 from app.schemas.assistant import (
     BatchDeleteEventsInput,
     BatchMoveEventsInput,
@@ -217,7 +219,39 @@ def _parse_attachment_text(text: str) -> tuple[list[str], list[str], list[str]]:
     return subjects[:10], topics[:20], structure[:20]
 
 
-def _execute_parse_schedule_image(tool_args: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
+async def _parse_attachment_text_with_gemma(text: str) -> tuple[list[str], list[str], list[str]]:
+    baseline = _parse_attachment_text(text)
+    gemma_json = await GemmaClient().generate_json(
+        schema_name="ScheduleImageTextExtraction",
+        system_prompt=(
+            "Extract structured schedule information from OCR/text preview. Return JSON with subjects, topics, "
+            "and schedule_structure arrays of concise strings. schedule_structure should include rows with days, "
+            "dates, times, event/class titles, and locations when visible."
+        ),
+        payload={
+            "text_preview": text[:4000],
+            "deterministic_baseline": {
+                "subjects": baseline[0],
+                "topics": baseline[1],
+                "schedule_structure": baseline[2],
+            },
+        },
+        max_output_tokens=settings.nano_max_output_tokens,
+    )
+    if isinstance(gemma_json, dict):
+        subjects = gemma_json.get("subjects")
+        topics = gemma_json.get("topics")
+        structure = gemma_json.get("schedule_structure")
+        if isinstance(subjects, list) and isinstance(topics, list) and isinstance(structure, list):
+            return (
+                [str(item).strip()[:180] for item in subjects if str(item).strip()][:10],
+                [str(item).strip()[:180] for item in topics if str(item).strip()][:20],
+                [str(item).strip()[:220] for item in structure if str(item).strip()][:20],
+            )
+    return baseline
+
+
+async def _execute_parse_schedule_image(tool_args: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
     requested_id = tool_args.get("attachment_id")
     selected = None
     for attachment in attachments:
@@ -236,7 +270,7 @@ def _execute_parse_schedule_image(tool_args: dict[str, Any], attachments: list[d
     if not text:
         return json.dumps({"error": "The uploaded image has no extracted text. Ask the user to re-upload a clearer image."})
 
-    subjects, topics, structure = _parse_attachment_text(text)
+    subjects, topics, structure = await _parse_attachment_text_with_gemma(text)
     result = ParseScheduleImageResult(
         success=True,
         metadata=ToolExecutionMetadata(tool="parse_schedule_image", executed=True),
@@ -289,7 +323,7 @@ async def execute_tool_call(
     logger.debug("planner.tool_call", extra={"tool_name": tool_name, "tool_args": tool_args})
 
     if tool_name == "parse_schedule_image":
-        return _execute_parse_schedule_image(tool_args, attachments or [])
+        return await _execute_parse_schedule_image(tool_args, attachments or [])
 
     input_model = TOOL_MODELS[tool_name]
     

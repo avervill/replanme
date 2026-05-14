@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from app.core.config import settings
+from app.llm.gemma import GemmaClient
 from app.services.assistant.types import ComplexityInput, ModelSelection
 from app.services.subscriptions import PlanName, get_user_plan
+
+
+def _planner_model_name(default: str) -> str:
+    return settings.gemma_model if GemmaClient().configured else default
 
 
 def calculate_planning_complexity(input: ComplexityInput) -> int:
@@ -61,7 +66,7 @@ def select_planner_model(score: int, *, user: object) -> ModelSelection:
     allow_deep = deep_planning_allowed(user)
     if score <= settings.planner_default_threshold:
         return ModelSelection(
-            model=settings.default_planner_model,
+            model=_planner_model_name(settings.default_planner_model),
             tier="default",
             max_input_tokens=settings.planner_max_input_tokens,
             max_output_tokens=settings.planner_max_output_tokens,
@@ -70,7 +75,7 @@ def select_planner_model(score: int, *, user: object) -> ModelSelection:
         )
     if score <= settings.planner_hard_threshold:
         return ModelSelection(
-            model=settings.hard_planner_model,
+            model=_planner_model_name(settings.hard_planner_model),
             tier="hard",
             max_input_tokens=settings.hard_planner_max_input_tokens,
             max_output_tokens=settings.hard_planner_max_output_tokens,
@@ -79,7 +84,7 @@ def select_planner_model(score: int, *, user: object) -> ModelSelection:
         )
     if allow_deep:
         return ModelSelection(
-            model=settings.deep_planner_model,
+            model=_planner_model_name(settings.deep_planner_model),
             tier="deep",
             max_input_tokens=settings.deep_planner_max_input_tokens,
             max_output_tokens=settings.deep_planner_max_output_tokens,
@@ -87,7 +92,7 @@ def select_planner_model(score: int, *, user: object) -> ModelSelection:
             deep_planning_allowed=True,
         )
     return ModelSelection(
-        model=settings.hard_planner_model,
+        model=_planner_model_name(settings.hard_planner_model),
         tier="hard",
         max_input_tokens=settings.hard_planner_max_input_tokens,
         max_output_tokens=settings.hard_planner_max_output_tokens,
@@ -95,4 +100,3 @@ def select_planner_model(score: int, *, user: object) -> ModelSelection:
         deep_planning_allowed=False,
         compact_planning=True,
     )
-

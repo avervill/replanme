@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timedelta
-from typing import Any
-
-from openai import AsyncOpenAI
 
 from app.core.config import settings
-from app.llm.openai_params import completion_token_param
-from app.services.assistant.cost_estimator import log_model_cost
+from app.llm.gemma import GemmaClient
 from app.services.assistant.types import Constraint, Deadline, ExtractedPlanningContext, PlanningState, RecurringTask
 
 DAY_INDEX = {
@@ -251,47 +246,50 @@ def deterministic_extract(prompt: str, now: datetime, planning_state: PlanningSt
 
 
 class ConstraintExtractor:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=settings.openai_api_key or "unused")
+    def __init__(self, client: object | None = None, gemma_client: GemmaClient | None = None):
+        self.gemma = gemma_client or GemmaClient()
 
     async def extract(self, *, prompt: str, now: datetime, planning_state: PlanningState | None) -> ExtractedPlanningContext:
         deterministic = deterministic_extract(prompt, now, planning_state)
-        if not settings.openai_api_key:
-            return deterministic
-
         payload = {
             "message": prompt,
             "now": now.isoformat(),
             "existing_deadlines": [deadline.model_dump() for deadline in (planning_state.deadlines if planning_state else [])],
             "existing_constraints": [constraint.model_dump() for constraint in (planning_state.constraints if planning_state else [])],
+            "existing_recurring_tasks": [task.model_dump() for task in (planning_state.latest_plan.sessions if planning_state and planning_state.latest_plan else [])],
+            "deterministic_baseline": deterministic.model_dump(mode="json"),
         }
-        log_model_cost(
-            phase="extraction",
-            model=settings.extraction_model,
-            input_payload=payload,
+        gemma_json = await self.gemma.generate_json(
+            schema_name="ExtractedPlanningContext",
+            system_prompt=(
+                "Extract planning context from the user's request. Return JSON matching ExtractedPlanningContext: "
+                "deadlines, constraints, recurring_tasks, planning_window_start, planning_window_end, planning_window_days, "
+                "target_hours, requires_energy_optimization, requires_calendar_rewrite, deadlines_count, constraints_count. "
+                "Use ISO datetimes. Preserve explicitly mentioned subjects/tasks. Support English and Russian."
+            ),
+            payload=payload,
             max_output_tokens=settings.nano_max_output_tokens,
         )
-        response = await self.client.chat.completions.create(
-            model=settings.extraction_model,
-            messages=[
-                {"role": "system", "content": "Extract planning deadlines, constraints, target hours, and planning window. Return JSON only."},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            response_format={"type": "json_object"},
-            **completion_token_param(settings.extraction_model, settings.nano_max_output_tokens),
-        )
-        try:
-            extracted = ExtractedPlanningContext.model_validate_json(response.choices[0].message.content or "{}")
-        except Exception:
-            return deterministic
-        if not extracted.deadlines:
-            extracted.deadlines = deterministic.deadlines
-        if not extracted.constraints:
-            extracted.constraints = deterministic.constraints
-        if not extracted.planning_window_start:
-            extracted.planning_window_start = deterministic.planning_window_start
-        if not extracted.planning_window_end:
-            extracted.planning_window_end = deterministic.planning_window_end
-        extracted.deadlines_count = len(extracted.deadlines)
-        extracted.constraints_count = len(extracted.constraints)
-        return extracted
+        if isinstance(gemma_json, dict):
+            try:
+                extracted = ExtractedPlanningContext.model_validate(gemma_json)
+            except Exception:
+                extracted = None
+            if extracted is not None:
+                if not extracted.deadlines:
+                    extracted.deadlines = deterministic.deadlines
+                if not extracted.constraints:
+                    extracted.constraints = deterministic.constraints
+                if not extracted.recurring_tasks:
+                    extracted.recurring_tasks = deterministic.recurring_tasks
+                if not extracted.planning_window_start:
+                    extracted.planning_window_start = deterministic.planning_window_start
+                if not extracted.planning_window_end:
+                    extracted.planning_window_end = deterministic.planning_window_end
+                if extracted.planning_window_days <= 1:
+                    extracted.planning_window_days = deterministic.planning_window_days
+                extracted.deadlines_count = len(extracted.deadlines)
+                extracted.constraints_count = len(extracted.constraints)
+                return extracted
+
+        return deterministic

@@ -10,6 +10,8 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.user import User
+from app.core.config import settings
+from app.llm.gemma import GemmaClient
 from app.services import analytics
 from app.services.billing_config import PlanName, SubscriptionStatus
 from app.services.credits import CreditReservation, maybe_refill_credits, spend_credits
@@ -101,6 +103,41 @@ def classify_prompt_feature(prompt: str, *, has_image_attachment: bool = False) 
         return FeatureName.BASIC_AI_ACTION
 
     return None
+
+
+async def classify_prompt_feature_with_gemma(prompt: str, *, has_image_attachment: bool = False) -> str | None:
+    deterministic = classify_prompt_feature(prompt, has_image_attachment=has_image_attachment)
+    gemma_json = await GemmaClient().generate_json(
+        schema_name="FeatureClassification",
+        system_prompt=(
+            "Classify which paid feature a calendar assistant prompt should use. Return JSON with "
+            "feature and reason. feature must be one of BASIC_AI_ACTION, WEEKLY_PLANNING, "
+            "MONTHLY_PLANNING, IMAGE_TO_CALENDAR, VOICE_TO_CALENDAR, ENERGY_SCHEDULING, "
+            "SMART_RESCHEDULING, RECURRING_AI_PLANNING, or null. Use null for ordinary chat/search."
+        ),
+        payload={
+            "message": prompt,
+            "has_image_attachment": has_image_attachment,
+            "deterministic_baseline": deterministic,
+        },
+        max_output_tokens=settings.nano_max_output_tokens,
+    )
+    if isinstance(gemma_json, dict):
+        feature = gemma_json.get("feature")
+        valid = {
+            FeatureName.BASIC_AI_ACTION,
+            FeatureName.WEEKLY_PLANNING,
+            FeatureName.MONTHLY_PLANNING,
+            FeatureName.IMAGE_TO_CALENDAR,
+            FeatureName.VOICE_TO_CALENDAR,
+            FeatureName.ENERGY_SCHEDULING,
+            FeatureName.SMART_RESCHEDULING,
+            FeatureName.RECURRING_AI_PLANNING,
+            None,
+        }
+        if feature in valid:
+            return feature
+    return deterministic
 
 
 def set_active_billing_feature(feature: str | None) -> Token:
@@ -298,6 +335,7 @@ __all__ = [
     "build_usage_summary",
     "check_feature_access",
     "classify_prompt_feature",
+    "classify_prompt_feature_with_gemma",
     "commit_usage",
     "estimate_credits_for_action",
     "get_user_id",

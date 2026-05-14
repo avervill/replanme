@@ -41,6 +41,7 @@ from app.llm.tools import compact_tool_response, execute_tool_call, get_openai_t
 from app.services.assistant.state import ConversationStateStore
 from app.services.assistant.memory import PlanningMemoryService
 from app.services.subscriptions import FeatureName, PaywallError, commit_usage, refund_usage, reserve_usage
+from app.llm.gemma import GemmaClient
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,12 @@ MINUTE_WORD_PATTERN = (
     "five|ten|fifteen|twenty|twenty[-\\s]five|thirty|forty|forty[-\\s]five|fifty|fifty[-\\s]five"
 )
 TIME_TOKEN_PATTERN = r"(?:\d{1,2}(?::[0-5]\d)?\s*(?:am|pm)?|noon|midnight)"
+AFFIRMATIVE_CREATE_REPLIES = {
+    "sounds good",
+    "that works",
+    "works for me",
+    "that sounds good",
+}
 
 
 @dataclass
@@ -268,6 +275,30 @@ def _classify_prompt_intent(prompt: str, attachments: list[dict[str, Any]]) -> s
     ):
         return "query"
     return "chat"
+
+
+async def _classify_prompt_intent_with_gemma(prompt: str, attachments: list[dict[str, Any]]) -> str:
+    baseline = _classify_prompt_intent(prompt, attachments)
+    gemma_json = await GemmaClient().generate_json(
+        schema_name="LegacyPromptIntent",
+        system_prompt=(
+            "Classify a calendar assistant prompt for tool routing. Return JSON with one key intent. "
+            "intent must be one of create, query, delete, move, update, conflict, planning, image, chat. "
+            "Use image only when the user references an uploaded image."
+        ),
+        payload={
+            "message": prompt,
+            "attachments_count": len(attachments or []),
+            "has_image_reference": bool(attachments and _references_uploaded_image(prompt, attachments)),
+            "deterministic_baseline": baseline,
+        },
+        max_output_tokens=settings.nano_max_output_tokens,
+    )
+    if isinstance(gemma_json, dict):
+        intent = gemma_json.get("intent")
+        if intent in {"create", "query", "delete", "move", "update", "conflict", "planning", "image", "chat"}:
+            return str(intent)
+    return baseline
 
 
 def _select_tool_names(intent: str, must_parse_image: bool) -> tuple[str, ...]:
@@ -494,6 +525,15 @@ def _latest_title_from_schedule_clarification(history: list[dict[str, Any]]) -> 
     return None
 
 
+def _relative_day_from_token(token: str) -> tuple[str, int] | None:
+    normalized = token.casefold().strip()
+    if normalized == "today" or SequenceMatcher(None, normalized, "today").ratio() >= 0.84:
+        return "today", 0
+    if normalized == "tomorrow" or SequenceMatcher(None, normalized, "tomorrow").ratio() >= 0.78:
+        return "tomorrow", 1
+    return None
+
+
 def _merge_schedule_clarification_reply(prompt: str, history: list[dict[str, Any]], now: datetime) -> str | None:
     title = _latest_title_from_schedule_clarification(history)
     if not title:
@@ -666,6 +706,10 @@ def _find_date_fragment(prompt: str, now: datetime) -> tuple[datetime, tuple[int
         match = re.search(pattern, normalized)
         if match:
             return now + timedelta(days=offset), match.span()
+    for match in re.finditer(r"\b[a-z]{4,10}\b", normalized):
+        relative = _relative_day_from_token(match.group(0))
+        if relative:
+            return now + timedelta(days=relative[1]), match.span()
 
     iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", prompt)
     if iso_match:
@@ -773,6 +817,11 @@ def _find_date_expression(prompt: str, now: datetime) -> tuple[str, datetime, tu
         match = re.search(pattern, normalized)
         if match:
             return label, now + timedelta(days=offset), match.span()
+    for match in re.finditer(r"\b[a-z]{4,10}\b", normalized):
+        relative = _relative_day_from_token(match.group(0))
+        if relative:
+            label, offset = relative
+            return label, now + timedelta(days=offset), match.span()
 
     weekend = re.search(r"\bthis\s+weekend\b", normalized)
     if weekend:
@@ -830,6 +879,8 @@ def _intent_from_calendar_prompt(prompt: str) -> str:
     if re.search(r"\b(update|edit|rename|change)\b", normalized):
         return "update_event"
     if re.search(CREATE_VERB_PATTERN, normalized):
+        return "create_single_event"
+    if re.search(r"\b(?:i\s+)?(?:need|want|would\s+like)\s+to\s+(?:go\s+to|visit|attend)\b", normalized):
         return "create_single_event"
     if _looks_like_bare_event_create(prompt):
         return "create_single_event"
@@ -892,6 +943,7 @@ def _remove_spans(text: str, spans: list[tuple[int, int]]) -> str:
 def _clean_extracted_title(prompt: str, *, intent: str, spans_to_remove: list[tuple[int, int]]) -> str | None:
     title = _remove_spans(prompt, spans_to_remove)
     title = re.sub(CREATE_VERB_PREFIX_PATTERN, "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:i\s+)?(?:need|want|would\s+like)\s+to\s+(?:go\s+to|visit|attend)\s+(?:the\s+)?", "", title, flags=re.IGNORECASE)
     title = re.sub(r"^\s*back\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"^\s*(move|reschedule|delete|remove|clear|update|edit|rename|change)\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(?:from|to|until|at|on|for|this|next)\s*$", " ", title, flags=re.IGNORECASE)
@@ -987,6 +1039,84 @@ def _extract_simple_calendar_command(prompt: str, now: datetime) -> SimpleCalend
     return extraction
 
 
+def _simple_extraction_from_mapping(data: dict[str, Any], fallback: SimpleCalendarExtraction) -> SimpleCalendarExtraction | None:
+    intent = data.get("intent")
+    if intent not in {"create_single_event", "move_event", "delete_event", "update_event", "unknown"}:
+        return None
+
+    date_value = None
+    raw_date_value = data.get("date_value")
+    if isinstance(raw_date_value, str) and raw_date_value:
+        try:
+            date_value = datetime.fromisoformat(raw_date_value)
+        except ValueError:
+            date_value = None
+    if date_value is None and data.get("date") == fallback.date:
+        date_value = fallback.date_value
+
+    extraction = SimpleCalendarExtraction(
+        intent=str(intent),
+        title=str(data["title"]).strip()[:120] if data.get("title") else None,
+        date=str(data["date"]).strip()[:80] if data.get("date") else None,
+        date_value=date_value,
+        start_time=str(data["start_time"]).strip() if data.get("start_time") else None,
+        end_time=str(data["end_time"]).strip() if data.get("end_time") else None,
+        duration_minutes=int(data["duration_minutes"]) if isinstance(data.get("duration_minutes"), int) else None,
+        missing_fields=[str(item) for item in data.get("missing_fields", []) if isinstance(item, str)],
+        confidence=float(data.get("confidence", 0.8) or 0.8),
+        relative_time=str(data["relative_time"]).strip() if data.get("relative_time") else None,
+        approximate_time=str(data["approximate_time"]).strip() if data.get("approximate_time") else None,
+        old_time=str(data["old_time"]).strip() if data.get("old_time") else None,
+        new_time=str(data["new_time"]).strip() if data.get("new_time") else None,
+        requires_calendar_read=bool(data.get("requires_calendar_read", False)),
+    )
+
+    missing: list[str] = []
+    if extraction.intent in {"create_single_event", "move_event", "delete_event", "update_event"}:
+        if not extraction.title:
+            missing.append("title")
+        if not extraction.date or not extraction.date_value:
+            missing.append("date")
+    if extraction.intent == "create_single_event":
+        if not extraction.start_time and not extraction.relative_time and not extraction.approximate_time:
+            missing.append("start_time")
+        if extraction.start_time and extraction.end_time is None and extraction.duration_minutes is None:
+            extraction.duration_minutes = 60
+    if extraction.intent == "move_event" and not extraction.new_time:
+        missing.append("start_time")
+    extraction.missing_fields = missing
+    return extraction
+
+
+async def _extract_simple_calendar_command_with_gemma(prompt: str, now: datetime) -> SimpleCalendarExtraction:
+    fallback = _extract_simple_calendar_command(prompt, now)
+    gemma_json = await GemmaClient().generate_json(
+        schema_name="SimpleCalendarExtraction",
+        system_prompt=(
+            "Extract a simple calendar command. Return JSON matching SimpleCalendarExtraction with keys "
+            "intent, title, date, date_value, start_time, end_time, duration_minutes, missing_fields, confidence, "
+            "relative_time, approximate_time, old_time, new_time, requires_calendar_read. "
+            "date_value must be an ISO datetime in the user's timezone when a date is known. "
+            "Use null for unknown optional fields."
+        ),
+        payload={
+            "message": prompt,
+            "now": now.isoformat(),
+            "timezone": str(now.tzinfo) if now.tzinfo else "UTC",
+            "deterministic_baseline": {
+                **fallback.__dict__,
+                "date_value": fallback.date_value.isoformat() if fallback.date_value else None,
+            },
+        },
+        max_output_tokens=settings.nano_max_output_tokens,
+    )
+    if isinstance(gemma_json, dict):
+        parsed = _simple_extraction_from_mapping(gemma_json, fallback)
+        if parsed is not None:
+            return parsed
+    return fallback
+
+
 def _duration_minutes_from_prompt(prompt: str) -> int | None:
     match = re.search(r"\bfor\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|h)\b", prompt, re.IGNORECASE)
     if match:
@@ -1071,7 +1201,7 @@ def _format_event_list(events: list[Any]) -> str:
 
 def _is_confirmation_yes(prompt: str) -> bool:
     normalized = re.sub(r"[.!?\s]+$", "", prompt.strip().casefold())
-    return normalized in {
+    return normalized in AFFIRMATIVE_CREATE_REPLIES or normalized in {
         "yes",
         "y",
         "yeah",
@@ -1091,7 +1221,94 @@ def _is_confirmation_yes(prompt: str) -> bool:
 
 def _is_confirmation_no(prompt: str) -> bool:
     normalized = re.sub(r"[.!?\s]+$", "", prompt.strip().casefold())
-    return normalized in {"no", "nope", "cancel", "stop", "don't", "do not", "never mind", "nevermind"}
+    return normalized in {"no", "nope", "cancel", "stop", "don't", "do not", "never mind", "nevermind", "another time", "not that time"}
+
+
+def _looks_like_time_suggestion_request(prompt: str) -> bool:
+    normalized = prompt.casefold()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "suggest",
+            "you choose",
+            "you pick",
+            "i dont know",
+            "i don't know",
+            "not sure",
+            "maybe afternoon",
+            "myabe affternoon",
+            "afternoon",
+            "morning",
+            "evening",
+        )
+    )
+
+
+def _suggested_hour_from_prompt(prompt: str) -> int:
+    normalized = prompt.casefold()
+    if "morning" in normalized:
+        return 9
+    if "evening" in normalized:
+        return 18
+    return 15
+
+
+def _human_date_label(value: datetime, now: datetime) -> str:
+    if value.date() == (now + timedelta(days=1)).date():
+        return "tomorrow"
+    if value.date() == now.date():
+        return "today"
+    return value.strftime("%A %Y-%m-%d")
+
+
+def _pending_create_missing(payload: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not str(payload.get("title") or "").strip():
+        missing.append("title")
+    if not str(payload.get("start_at") or "").strip():
+        missing.append("start_at")
+    if not str(payload.get("end_at") or "").strip():
+        missing.append("end_at")
+    return missing
+
+
+def _pending_payload_from_extraction(extracted: SimpleCalendarExtraction, timezone: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "title": extracted.title,
+        "timezone": timezone,
+        "duration_minutes": extracted.duration_minutes or 60,
+        "date": extracted.date,
+        "date_value": extracted.date_value.isoformat() if extracted.date_value else None,
+    }
+    if extracted.date_value and extracted.start_time:
+        start_hour, start_minute = [int(part) for part in extracted.start_time.split(":")]
+        start_at = extracted.date_value.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+        if extracted.end_time:
+            end_hour, end_minute = [int(part) for part in extracted.end_time.split(":")]
+            end_at = extracted.date_value.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+            if end_at <= start_at:
+                end_at += timedelta(hours=12)
+        else:
+            end_at = start_at + timedelta(minutes=extracted.duration_minutes or 60)
+        payload["start_at"] = start_at.isoformat()
+        payload["end_at"] = end_at.isoformat()
+    return payload
+
+
+def _pending_action_for_create(payload: dict[str, Any], *, requires_confirmation: bool, status: str = "awaiting_confirmation") -> PendingCalendarAction:
+    return PendingCalendarAction(
+        id=uuid.uuid4().hex,
+        action="create_event",
+        status=status,  # type: ignore[arg-type]
+        requires_confirmation=requires_confirmation,
+        filters=PendingActionFilters(
+            title=payload.get("title"),
+            date=payload.get("date"),
+            time_range=f"{payload.get('start_at')}..{payload.get('end_at')}" if payload.get("start_at") and payload.get("end_at") else None,
+        ),
+        payload=payload,
+        created_at=datetime.now(UTC).isoformat(),
+    )
 
 
 def _format_date_for_user(value: datetime) -> str:
@@ -1278,7 +1495,7 @@ class PlannerAgent:
             state.confirmation_target = None
             state.awaiting_confirmation = False
             await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
-            reply = "Okay, I won't delete anything."
+            reply = "Okay, I won't schedule that." if pending.action == "create_event" else "Okay, I won't delete anything."
             await memory_handler.add_assistant_message(reply)
             return self._calendar_response(
                 session_id=session_id,
@@ -1289,10 +1506,21 @@ class PlannerAgent:
                 execution=PlanExecutionResult(status="completed"),
             )
 
+        if pending.action == "create_event":
+            return await self._execute_pending_create(
+                state=state,
+                pending=pending,
+                session_id=session_id,
+                user=user,
+                db=db,
+                memory_response=memory_response,
+                memory_handler=memory_handler,
+            )
+
         if pending.action != "delete_event":
             return None
 
-        reservation = await reserve_usage(db, user, FeatureName.BASIC_AI_ACTION)
+        reservation = await reserve_usage(db, user, FeatureName.BASIC_AI_ACTION) if db is not None else None
         deleted_events: list[CalendarEventSnapshot] = []
         errors: list[str] = []
         try:
@@ -1348,6 +1576,280 @@ class PlannerAgent:
                 error=None if deleted_events else reply,
             ),
             referenced_events=deleted_events,
+        )
+
+    async def _execute_pending_create(
+        self,
+        *,
+        state: Any,
+        pending: PendingCalendarAction,
+        session_id: str,
+        user: User,
+        db: AsyncSession,
+        memory_response: Any,
+        memory_handler: AgentMemoryHandler,
+    ) -> AssistantMessageResponse:
+        payload = dict(pending.payload or {})
+        missing = _pending_create_missing(payload)
+        if missing:
+            pending.status = "draft"
+            pending.requires_confirmation = False
+            state.pending_action = pending
+            state.confirmation_target = None
+            state.awaiting_confirmation = False
+            await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+            if "title" in missing:
+                reply = "What should I call the event?"
+            elif "start_at" in missing:
+                reply = f"What time should I schedule {payload.get('title') or 'it'}?"
+            else:
+                reply = f"How long should {payload.get('title') or 'it'} be?"
+            await memory_handler.add_assistant_message(reply)
+            return self._calendar_response(
+                session_id=session_id,
+                reply=reply,
+                memory=memory_response.memory,
+                intent="CREATE_EVENT",
+                reason="Pending create action is missing required fields.",
+                execution=PlanExecutionResult(status="completed"),
+            )
+
+        title = str(payload["title"]).strip()
+        start_at = datetime.fromisoformat(str(payload["start_at"]))
+        end_at = datetime.fromisoformat(str(payload["end_at"]))
+        timezone_value = str(payload.get("timezone") or getattr(user, "timezone", "UTC") or "UTC")
+        reservation = await reserve_usage(db, user, FeatureName.BASIC_AI_ACTION) if db is not None else None
+        try:
+            result = await self.registry.create_event(
+                CreateEventInput(
+                    title=title,
+                    start_at=start_at,
+                    end_at=end_at,
+                    timezone=timezone_value,
+                ),
+                user=user,
+                db=db,
+                memory=memory_response.memory,
+            )
+        except PaywallError:
+            await refund_usage(db, reservation)
+            raise
+        except ValueError as exc:
+            await refund_usage(db, reservation)
+            reply = str(exc)
+            await memory_handler.add_assistant_message(reply)
+            return self._calendar_response(
+                session_id=session_id,
+                reply=reply,
+                memory=memory_response.memory,
+                intent="CREATE_EVENT",
+                reason="Pending create action hit a calendar validation guard.",
+                execution=PlanExecutionResult(status="completed", error=reply),
+            )
+        except Exception:
+            await refund_usage(db, reservation)
+            raise
+
+        await commit_usage(db, reservation)
+        pending.status = "executed"
+        state.pending_action = None
+        state.confirmation_target = None
+        state.awaiting_confirmation = False
+        await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+
+        event = result.created_events[0] if result.created_events else None
+        if event:
+            await memory_handler.update_last_event(event.id, event.title)
+        reply = f"Scheduled: {title} {start_at.strftime('%a %Y-%m-%d')} {start_at.strftime('%H:%M')}-{end_at.strftime('%H:%M')}."
+        await memory_handler.add_assistant_message(reply)
+        return self._base_response(
+            session_id=session_id,
+            reply=reply,
+            memory=memory_response.memory,
+            intent="create",
+            route_reason="Executed confirmed pending create action.",
+            execution=PlanExecutionResult(
+                status="completed",
+                executed_steps=1,
+                preview=result.preview,
+                rollback_available=bool(result.rollback),
+                created_events=result.created_events,
+            ),
+        )
+
+    async def _save_pending_create_draft(
+        self,
+        *,
+        session_id: str,
+        user: User,
+        extracted: SimpleCalendarExtraction,
+        timezone_str: str,
+    ) -> None:
+        payload = _pending_payload_from_extraction(extracted, timezone_str)
+        action = _pending_action_for_create(payload, requires_confirmation=False, status="draft")
+        state = await self.state_store.load(user_id=str(user.id), session_id=session_id)
+        state.current_intent = "CREATE_EVENT"
+        state.pending_action = action
+        state.confirmation_target = None
+        state.awaiting_confirmation = False
+        await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+
+    async def _latest_pending_create_context(
+        self,
+        *,
+        session_id: str,
+        user: User,
+        history: list[dict[str, Any]],
+        now_local: datetime,
+        timezone_str: str,
+    ) -> tuple[Any, PendingCalendarAction] | None:
+        state = await self.state_store.load(user_id=str(user.id), session_id=session_id)
+        pending = state.pending_action if state.pending_action and state.pending_action.action == "create_event" else None
+        if pending:
+            return state, pending
+        for message in reversed(history):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            extracted = await _extract_simple_calendar_command_with_gemma(content, now_local)
+            if extracted.intent == "create_single_event" and (extracted.title or extracted.date_value):
+                payload = _pending_payload_from_extraction(extracted, timezone_str)
+                pending = _pending_action_for_create(payload, requires_confirmation=False, status="draft")
+                state.pending_action = pending
+                state.current_intent = "CREATE_EVENT"
+                await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+                return state, pending
+        return None
+
+    async def _try_pending_create_time_suggestion(
+        self,
+        *,
+        prompt: str,
+        history: list[dict[str, Any]],
+        session_id: str,
+        timezone_str: str,
+        now_local: datetime,
+        user: User,
+        memory_response: Any,
+        memory_handler: AgentMemoryHandler,
+    ) -> AssistantMessageResponse | None:
+        if not _looks_like_time_suggestion_request(prompt):
+            return None
+        context = await self._latest_pending_create_context(
+            session_id=session_id,
+            user=user,
+            history=history,
+            now_local=now_local,
+            timezone_str=timezone_str,
+        )
+        if not context:
+            return None
+        state, pending = context
+        payload = dict(pending.payload or {})
+        title = str(payload.get("title") or "").strip()
+        date_raw = payload.get("date_value")
+        if not title or not date_raw:
+            return None
+        date_value = datetime.fromisoformat(str(date_raw))
+        start_at = date_value.replace(hour=_suggested_hour_from_prompt(prompt), minute=0, second=0, microsecond=0)
+        end_at = start_at + timedelta(minutes=int(payload.get("duration_minutes") or 60))
+        payload.update(
+            {
+                "title": title,
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+                "timezone": timezone_str,
+                "date": payload.get("date") or _human_date_label(start_at, now_local),
+                "date_value": date_value.isoformat(),
+                "duration_minutes": int(payload.get("duration_minutes") or 60),
+            }
+        )
+        action = _pending_action_for_create(payload, requires_confirmation=True, status="awaiting_confirmation")
+        state.pending_action = action
+        state.confirmation_target = action
+        state.awaiting_confirmation = True
+        state.current_intent = "CREATE_EVENT"
+        await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+
+        await memory_handler.add_user_message(prompt)
+        date_label = _human_date_label(start_at, now_local)
+        reply = f"Let's schedule {title} {date_label} at {start_at.strftime('%H:%M')}. Does that sound good?"
+        await memory_handler.add_assistant_message(reply)
+        preview = [
+            PlanPreviewChange(
+                action="create_event",
+                title=title,
+                details="Create event after confirmation.",
+                proposed_start_at=start_at,
+                proposed_end_at=end_at,
+            )
+        ]
+        return self._calendar_response(
+            session_id=session_id,
+            reply=reply,
+            memory=memory_response.memory,
+            intent="CREATE_EVENT",
+            reason="Suggested a concrete time for a pending create request.",
+            execution=PlanExecutionResult(status="awaiting_confirmation", preview=preview),
+            requires_confirmation=True,
+            display_actions=[DisplayAction(kind="ask_user", summary=f"Schedule {title} at {start_at.strftime('%H:%M')}.")],
+            awaiting_confirmation=True,
+            confirmation_token=action.id,
+        )
+
+    async def _try_pending_create_field_reply(
+        self,
+        *,
+        prompt: str,
+        session_id: str,
+        timezone_str: str,
+        now_local: datetime,
+        user: User,
+        db: AsyncSession,
+        memory_response: Any,
+        memory_handler: AgentMemoryHandler,
+    ) -> AssistantMessageResponse | None:
+        state = await self.state_store.load(user_id=str(user.id), session_id=session_id)
+        pending = state.pending_action if state.pending_action and state.pending_action.action == "create_event" else None
+        if not pending or state.awaiting_confirmation:
+            return None
+        payload = dict(pending.payload or {})
+        missing = _pending_create_missing(payload)
+        if not missing:
+            return None
+        if "title" in missing and prompt.strip() and not _find_time_fragment(prompt):
+            payload["title"] = " ".join(prompt.strip(" .").split())[:120]
+        if "start_at" in missing:
+            title = payload.get("title") or "event"
+            merged = f"schedule {title} {prompt}"
+            if payload.get("date"):
+                merged = f"{merged} {payload['date']}"
+            extracted = await _extract_simple_calendar_command_with_gemma(merged, now_local)
+            if extracted.date_value and extracted.start_time:
+                payload.update(_pending_payload_from_extraction(extracted, timezone_str))
+                if payload.get("title") == "event" and title != "event":
+                    payload["title"] = title
+        pending.payload = payload
+        pending.filters = PendingActionFilters(
+            title=payload.get("title"),
+            date=payload.get("date"),
+            time_range=f"{payload.get('start_at')}..{payload.get('end_at')}" if payload.get("start_at") and payload.get("end_at") else None,
+        )
+        state.pending_action = pending
+        await self.state_store.save(user_id=str(user.id), session_id=session_id, state=state)
+        if _pending_create_missing(payload):
+            return None
+        await memory_handler.add_user_message(prompt)
+        return await self._execute_pending_create(
+            state=state,
+            pending=pending,
+            session_id=session_id,
+            user=user,
+            db=db,
+            memory_response=memory_response,
+            memory_handler=memory_handler,
         )
 
     async def _try_bulk_delete_confirmation(
@@ -1457,7 +1959,7 @@ class PlannerAgent:
         memory_handler: AgentMemoryHandler,
         history_message: str | None = None,
     ) -> AssistantMessageResponse | None:
-        extracted = _extract_simple_calendar_command(prompt, now_local)
+        extracted = await _extract_simple_calendar_command_with_gemma(prompt, now_local)
         _log_simple_extraction(extraction=extracted, raw_user_message=prompt)
         if extracted.intent != "create_single_event":
             return None
@@ -1534,11 +2036,13 @@ class PlannerAgent:
         *,
         prompt: str,
         session_id: str,
+        timezone_str: str,
         now_local: datetime,
+        user: User,
         memory_response: Any,
         memory_handler: AgentMemoryHandler,
     ) -> AssistantMessageResponse | None:
-        extracted = _extract_simple_calendar_command(prompt, now_local)
+        extracted = await _extract_simple_calendar_command_with_gemma(prompt, now_local)
         if extracted.intent != "create_single_event":
             return None
 
@@ -1547,6 +2051,12 @@ class PlannerAgent:
             return None
 
         await memory_handler.add_user_message(prompt)
+        await self._save_pending_create_draft(
+            session_id=session_id,
+            user=user,
+            extracted=extracted,
+            timezone_str=timezone_str,
+        )
         if "title" in extracted.missing_fields:
             reply = "What should I call the event?"
             reason = "title missing"
@@ -1639,13 +2149,13 @@ class PlannerAgent:
         conflict_mode = await memory_handler.get_conflict_mode()
         attachment_context = _build_attachment_context(payload.attachments)
         must_parse_image = _references_uploaded_image(payload.prompt, payload.attachments)
-        intent = _classify_prompt_intent(payload.prompt, payload.attachments)
+        intent = await _classify_prompt_intent_with_gemma(payload.prompt, payload.attachments)
         
         timezone_str = payload.timezone or getattr(user, "timezone", "UTC") or "UTC"
         try:
             tz = zoneinfo.ZoneInfo(timezone_str)
         except Exception:
-            tz = zoneinfo.ZoneInfo("UTC")
+            tz = UTC
             
         now_local = datetime.now(tz)
         history = await memory_handler.get_history()
@@ -1664,6 +2174,32 @@ class PlannerAgent:
             return pending_response
 
         if not payload.attachments and not payload.dry_run and not payload.preview:
+            pending_field_response = await self._try_pending_create_field_reply(
+                prompt=payload.prompt,
+                session_id=session_id,
+                timezone_str=timezone_str,
+                now_local=now_local,
+                user=user,
+                db=db,
+                memory_response=memory_response,
+                memory_handler=memory_handler,
+            )
+            if pending_field_response:
+                return pending_field_response
+
+            suggested_time_response = await self._try_pending_create_time_suggestion(
+                prompt=payload.prompt,
+                history=history,
+                session_id=session_id,
+                timezone_str=timezone_str,
+                now_local=now_local,
+                user=user,
+                memory_response=memory_response,
+                memory_handler=memory_handler,
+            )
+            if suggested_time_response:
+                return suggested_time_response
+
             merged_create_prompt = _merge_schedule_clarification_reply(payload.prompt, history, now_local)
             if merged_create_prompt:
                 simple_response = await self._try_simple_create(
@@ -1726,7 +2262,9 @@ class PlannerAgent:
             clarification_response = await self._try_simple_create_clarification(
                 prompt=payload.prompt,
                 session_id=session_id,
+                timezone_str=timezone_str,
                 now_local=now_local,
+                user=user,
                 memory_response=memory_response,
                 memory_handler=memory_handler,
             )

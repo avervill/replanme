@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
-from openai import AsyncOpenAI
-
 from app.core.config import settings
-from app.llm.openai_params import completion_token_param
-from app.services.assistant.cost_estimator import log_model_cost
+from app.llm.gemma import GemmaClient
 from app.services.assistant.types import IntentClassification, PlanningState
 
 REVISION_PHRASES = (
@@ -152,8 +148,8 @@ def deterministic_intent(prompt: str, planning_state: PlanningState | None = Non
 
 
 class IntentClassifier:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=settings.openai_api_key or "unused")
+    def __init__(self, client: object | None = None, gemma_client: GemmaClient | None = None):
+        self.gemma = gemma_client or GemmaClient()
 
     async def classify(
         self,
@@ -163,42 +159,50 @@ class IntentClassifier:
         attachments: list[dict[str, Any]] | None = None,
     ) -> IntentClassification:
         deterministic = deterministic_intent(prompt, planning_state)
-        if deterministic is not None and deterministic.confidence >= 0.85:
-            return deterministic
 
-        if not settings.openai_api_key:
-            return deterministic or IntentClassification(intent="simple_chat", confidence=0.65, reason="Deterministic fallback.")
-
-        payload = {
+        gemma_payload = {
             "message": prompt,
             "has_active_plan": bool(planning_state and planning_state.active and planning_state.latest_plan),
             "active_plan_summary": planning_state.latest_assistant_plan_summary if planning_state else "",
             "attachments_count": len(attachments or []),
+            "deterministic_baseline": deterministic.model_dump(mode="json") if deterministic else None,
+            "allowed_intents": [
+                "simple_chat",
+                "create_single_event",
+                "delete_event",
+                "update_event",
+                "move_event",
+                "duplicate_event",
+                "duplicate_period",
+                "generate_plan",
+                "modify_existing_plan",
+                "optimize_schedule",
+                "confirm_plan_to_calendar",
+                "reject_plan",
+                "ask_clarification",
+                "answer_question",
+            ],
         }
-        log_model_cost(
-            phase="intent",
-            model=settings.intent_model,
-            input_payload=payload,
+        gemma_json = await self.gemma.generate_json(
+            schema_name="IntentClassification",
+            system_prompt=(
+                "Classify a calendar/planning assistant user message. Return a JSON object matching "
+                "IntentClassification with keys intent, confidence, is_calendar_mutation, requires_planning, "
+                "requires_calendar_read, requires_user_confirmation, complexity_hint, planning_scope, reason. "
+                "If an active plan exists and the user asks for more/intense/better/other days, use "
+                "modify_existing_plan, not create_single_event. If the user confirms or rejects an active plan, "
+                "use confirm_plan_to_calendar or reject_plan."
+            ),
+            payload=gemma_payload,
             max_output_tokens=settings.nano_max_output_tokens,
         )
-        response = await self.client.chat.completions.create(
-            model=settings.intent_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify the user's calendar assistant intent. Return JSON only. "
-                        "If there is an active plan and the user asks for more/intense/better/other days, "
-                        "use modify_existing_plan, never create_single_event."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            response_format={"type": "json_object"},
-            **completion_token_param(settings.intent_model, settings.nano_max_output_tokens),
-        )
-        raw = response.choices[0].message.content or "{}"
-        try:
-            return IntentClassification.model_validate_json(raw)
-        except Exception:
-            return deterministic or IntentClassification(intent="simple_chat", confidence=0.55, reason="Classifier JSON fallback.")
+        if isinstance(gemma_json, dict):
+            try:
+                return IntentClassification.model_validate(gemma_json)
+            except Exception:
+                pass
+
+        if deterministic is not None and deterministic.confidence >= 0.85:
+            return deterministic
+
+        return deterministic or IntentClassification(intent="simple_chat", confidence=0.65, reason="Gemma/deterministic fallback.")

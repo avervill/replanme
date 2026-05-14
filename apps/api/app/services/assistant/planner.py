@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from openai import AsyncOpenAI
-
 from app.core.config import settings
-from app.llm.openai_params import completion_token_param
-from app.services.assistant.cost_estimator import log_model_cost
+from app.llm.gemma import GemmaClient
 from app.services.assistant.types import (
     Deadline,
     ExtractedPlanningContext,
@@ -443,8 +439,8 @@ def deterministic_plan(
 
 
 class StructuredPlanner:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=settings.openai_api_key or "unused")
+    def __init__(self, client: object | None = None, gemma_client: GemmaClient | None = None):
+        self.gemma = gemma_client or GemmaClient()
 
     async def generate(
         self,
@@ -464,8 +460,6 @@ class StructuredPlanner:
             free_blocks=free_blocks,
             previous_state=planning_state,
         )
-        if not settings.openai_api_key:
-            return fallback
 
         payload = {
             "user_request": prompt,
@@ -484,38 +478,30 @@ class StructuredPlanner:
             "allowed_actions": ["draft_plan_only"],
             "calendar_mutation_rule": "calendar_actions must be empty until user confirmation",
             "compact_planning": model_selection.compact_planning,
+            "deterministic_baseline": fallback.model_dump(mode="json"),
         }
-        log_model_cost(
-            phase="planner",
-            model=model_selection.model,
-            input_payload=payload,
+        gemma_json = await self.gemma.generate_json(
+            schema_name="StructuredPlan",
+            system_prompt=(
+                "You are replanme's structured planning engine. Return JSON matching StructuredPlan. "
+                "Create useful calendar plan sessions only from tasks explicitly requested by the user, found in calendar context, "
+                "or clearly listed as assumptions. calendar_actions must be [] until user confirmation. "
+                "Use ISO datetimes and spread work realistically across free blocks."
+            ),
+            payload=payload,
             max_output_tokens=model_selection.max_output_tokens,
         )
-        response = await self.client.chat.completions.create(
-            model=model_selection.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are replanme's structured planning engine. Return JSON only matching: "
-                        "{plan_id,intent,summary,planning_window,sessions,assumptions,warnings,total_planned_hours,inferred_target_hours,"
-                        "requires_user_confirmation,calendar_actions}. For complex plans calendar_actions must be [].\n"
-                        "Each session should include subject for exam/deadline work.\n"
-                        "ANTI-HALLUCINATION: Only schedule tasks explicitly requested by the user, found in the calendar, or listed as assumptions. "
-                        "Do NOT invent subjects, exams, or tasks the user did not mention.\n"
-                        "For recurring tasks (gym, cooking, project work), use clean human-readable titles like "
-                        "'Gym session', 'Cooking', 'ML project deep work'. Never use leftover user-message fragments "
-                        "like 'I have ICT preparation' or 'and Anatomy preparation'.\n"
-                        "Spread sessions across the full planning window. Do not overload one day while leaving others empty."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            response_format={"type": "json_object"},
-            **completion_token_param(model_selection.model, model_selection.max_output_tokens),
-        )
+        if not isinstance(gemma_json, dict):
+            return fallback
+        gemma_json.setdefault("plan_id", uuid.uuid4().hex)
+        gemma_json.setdefault("status", "active_unconfirmed")
+        gemma_json.setdefault("created_at", datetime.now(UTC).isoformat())
+        gemma_json.setdefault("requires_user_confirmation", True)
+        gemma_json["calendar_actions"] = []
+        if not gemma_json.get("inferred_target_hours"):
+            gemma_json["inferred_target_hours"] = fallback.inferred_target_hours
         try:
-            plan = StructuredPlan.model_validate_json(response.choices[0].message.content or "{}")
+            plan = StructuredPlan.model_validate(gemma_json)
         except Exception:
             return fallback
         # Clean up session titles

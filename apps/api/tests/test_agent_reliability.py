@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import settings
 from app.llm.agent import (
+    PlannerAgent,
     _classify_prompt_intent,
     _date_from_prompt,
     _extract_simple_calendar_command,
@@ -15,11 +17,17 @@ from app.llm.agent import (
     _strip_tool_json_from_reply,
     _title_from_simple_create,
 )
+from app.llm.memory import AgentMemoryHandler
 from app.llm.tools import execute_tool_call
 from app.schemas.assistant import (
+    AssistantMessageRequest,
+    CalendarEventSnapshot,
+    ConversationState,
     CreateEventInput,
+    CreateEventResult,
     DetectConflictsInput,
     MoveEventInput,
+    ToolExecutionMetadata,
     UserPlanningMemory,
 )
 from app.services.assistant.tools import AssistantToolRegistry
@@ -33,6 +41,78 @@ def _google_event(event_id, title, start_at, end_at):
         "end": {"dateTime": end_at.isoformat(), "timeZone": "UTC"},
         "status": "confirmed",
     }
+
+
+class InMemoryStateStore:
+    def __init__(self):
+        self.states = {}
+
+    async def load(self, *, user_id, session_id):
+        return self.states.get((str(user_id), session_id), ConversationState(session_id=session_id))
+
+    async def save(self, *, user_id, session_id, state):
+        self.states[(str(user_id), session_id)] = state
+
+
+class FakeMemoryService:
+    async def get_memory(self, db, user):
+        return SimpleNamespace(memory=UserPlanningMemory())
+
+
+class FakeCreateRegistry:
+    MUTATING_TOOLS = {"create_event"}
+
+    def __init__(self):
+        self.created = []
+
+    async def create_event(self, payload, *, user, db, memory):
+        event = CalendarEventSnapshot(
+            id=f"evt-{len(self.created) + 1}",
+            title=payload.title,
+            description=payload.description,
+            start_at=payload.start_at,
+            end_at=payload.end_at,
+            timezone=payload.timezone,
+            location=None,
+            status="confirmed",
+            html_link=None,
+        )
+        self.created.append(event)
+        return CreateEventResult(
+            success=True,
+            metadata=ToolExecutionMetadata(tool="create_event", executed=True),
+            created_events=[event],
+        )
+
+
+def _fixed_agent(monkeypatch):
+    monkeypatch.setattr(settings, "gemma_ai_api_key", "")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 5, 13, 12, tzinfo=tz or UTC)
+
+    monkeypatch.setattr("app.llm.agent.datetime", FixedDateTime)
+    registry = FakeCreateRegistry()
+    state = InMemoryStateStore()
+    agent = PlannerAgent(
+        state_store=state,
+        memory_service=FakeMemoryService(),
+        tool_registry=registry,
+    )
+    return agent, state, registry
+
+
+def _chat(agent, prompt, *, session_id="s-follow"):
+    return asyncio.run(
+        agent.handle_message(
+            payload=AssistantMessageRequest(prompt=prompt, timezone="UTC", session_id=session_id, preview=False),
+            user=SimpleNamespace(id="user-1", timezone="UTC"),
+            db=None,
+        )
+    )
 
 
 def test_create_rejects_exact_duplicate_before_mutation(monkeypatch):
@@ -136,7 +216,8 @@ def test_move_event_refuses_to_create_new_conflict(monkeypatch):
     assert updates == []
 
 
-def test_parse_schedule_image_tool_uses_uploaded_image_text():
+def test_parse_schedule_image_tool_uses_uploaded_image_text(monkeypatch):
+    monkeypatch.setattr(settings, "gemma_ai_api_key", "")
     attachments = [
         {
             "id": "img-1",
@@ -164,6 +245,71 @@ def test_parse_schedule_image_tool_uses_uploaded_image_text():
         assert result["schedule_structure"]
 
     asyncio.run(run())
+
+
+def test_suggested_time_follow_up_creates_pending_gym_event(monkeypatch):
+    agent, _, registry = _fixed_agent(monkeypatch)
+
+    first = _chat(agent, "i need to go to the gym tomoroow")
+    assert "What time" in first.reply
+
+    suggestion = _chat(agent, "i dont know, you suggest")
+    assert suggestion.awaiting_confirmation is True
+    assert "15:00" in suggestion.reply
+    assert registry.created == []
+
+    confirmed = _chat(agent, "yes")
+
+    assert confirmed.execution.created_events
+    assert len(registry.created) == 1
+    created = registry.created[0]
+    assert created.title == "gym"
+    assert created.start_at.date().isoformat() == "2026-05-14"
+    assert created.start_at.strftime("%H:%M") == "15:00"
+
+
+def test_pending_create_can_be_cancelled(monkeypatch):
+    agent, _, registry = _fixed_agent(monkeypatch)
+
+    _chat(agent, "i need to go to the gym tomorrow")
+    _chat(agent, "you suggest")
+    cancelled = _chat(agent, "no")
+
+    assert "won't schedule" in cancelled.reply
+    assert registry.created == []
+
+
+def test_pending_create_title_reply_fills_missing_title(monkeypatch):
+    agent, _, registry = _fixed_agent(monkeypatch)
+
+    first = _chat(agent, "schedule tomorrow at 15:00")
+    assert "What should I call" in first.reply
+
+    completed = _chat(agent, "gym")
+
+    assert completed.execution.created_events
+    assert registry.created[0].title == "gym"
+    assert registry.created[0].start_at.strftime("%H:%M") == "15:00"
+
+
+def test_unrelated_yes_without_pending_create_does_not_create(monkeypatch):
+    agent, _, registry = _fixed_agent(monkeypatch)
+
+    async def run():
+        response = await agent._try_pending_confirmation(
+            prompt="yes",
+            confirm=False,
+            confirmation_token=None,
+            session_id="empty",
+            user=SimpleNamespace(id="user-1", timezone="UTC"),
+            db=None,
+            memory_response=SimpleNamespace(memory=UserPlanningMemory()),
+            memory_handler=AgentMemoryHandler(agent.state_store, "user-1", "empty"),
+        )
+        return response
+
+    assert asyncio.run(run()) is None
+    assert registry.created == []
 
 
 def test_simple_create_parser_handles_space_separated_24h_time():

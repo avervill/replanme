@@ -31,6 +31,7 @@ from app.core.config import settings
 
 def _disable_llm(monkeypatch):
     monkeypatch.setattr(settings, "openai_api_key", "")
+    monkeypatch.setattr(settings, "gemma_ai_api_key", "")
 
 
 class FakeStateStore:

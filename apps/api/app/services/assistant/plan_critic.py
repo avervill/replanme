@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import json
-
-from openai import AsyncOpenAI
-
 from app.core.config import settings
-from app.llm.openai_params import completion_token_param
+from app.llm.gemma import GemmaClient
 from app.schemas.assistant import CalendarEventSnapshot, UserPlanningMemory
-from app.services.assistant.cost_estimator import log_model_cost
 from app.services.assistant.planner import available_deadline_hours, infer_target_hours
 from app.services.assistant.types import Constraint, CriticEvaluation, Deadline, FreeBlock, RecurringTask, StructuredPlan
 
@@ -142,8 +137,8 @@ def deterministic_critic(
 
 
 class PlanCritic:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=settings.openai_api_key or "unused")
+    def __init__(self, client: object | None = None, gemma_client: GemmaClient | None = None):
+        self.gemma = gemma_client or GemmaClient()
 
     async def evaluate(
         self,
@@ -168,10 +163,6 @@ class PlanCritic:
             memory=memory,
             recurring_tasks=recurring_tasks,
         )
-        model = settings.critic_model_hard if complexity_score > settings.planner_default_threshold else settings.critic_model
-        if not settings.openai_api_key:
-            return fallback, "deterministic"
-
         payload = {
             "user_request": user_request,
             "plan": plan.model_dump(mode="json"),
@@ -189,32 +180,23 @@ class PlanCritic:
                 "Is calendar insertion still waiting for confirmation?",
             ],
         }
-        log_model_cost(
-            phase="critic",
-            model=model,
-            input_payload=payload,
+        gemma_json = await self.gemma.generate_json(
+            schema_name="CriticEvaluation",
+            system_prompt=(
+                "You are a planning critic. Do not create or modify the plan. Return JSON matching "
+                "CriticEvaluation with approved, score, main_reason, problems, repair_instructions, "
+                "user_satisfaction_risk. Judge whether a real user would find the plan useful."
+            ),
+            payload=payload,
             max_output_tokens=settings.nano_max_output_tokens,
         )
-        response = await self.client.chat.completions.create(
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a planning critic. Do not create or modify the plan. "
-                        "Return JSON only with approved, score, main_reason, problems, "
-                        "repair_instructions, user_satisfaction_risk."
-                    ),
-                },
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            response_format={"type": "json_object"},
-            **completion_token_param(model, settings.nano_max_output_tokens),
-        )
-        try:
-            critic = CriticEvaluation.model_validate_json(response.choices[0].message.content or "{}")
-        except Exception:
-            return fallback, model
-        if critic.score < settings.min_critic_approval_score:
-            critic.approved = False
-        return critic, model
+        if isinstance(gemma_json, dict):
+            try:
+                critic = CriticEvaluation.model_validate(gemma_json)
+            except Exception:
+                critic = None
+            if critic is not None:
+                if critic.score < settings.min_critic_approval_score:
+                    critic.approved = False
+                return critic, settings.gemma_model
+        return fallback, "deterministic"

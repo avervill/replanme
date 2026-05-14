@@ -434,6 +434,16 @@ class AssistantOrchestrator:
                 inferred_target_hours=plan.inferred_target_hours,
                 recurring_tasks=extracted.recurring_tasks,
             )
+            if (
+                classification.intent == "modify_existing_plan"
+                and planning_state
+                and planning_state.total_planned_hours is not None
+                and plan.total_planned_hours > planning_state.total_planned_hours
+            ):
+                remaining_issues = [issue for issue in validation.issues if issue.code != "insufficient_hours"]
+                if len(remaining_issues) != len(validation.issues):
+                    plan.warnings.append("Expanded the plan, but available calendar time may still be below the inferred target.")
+                    validation = PlanValidationResult(valid=not remaining_issues, issues=remaining_issues)
             if not validation.valid:
                 if attempt >= settings.max_plan_repair_attempts:
                     break

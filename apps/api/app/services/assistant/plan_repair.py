@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta
 
-from openai import AsyncOpenAI
-
 from app.core.config import settings
-from app.llm.openai_params import completion_token_param
+from app.llm.gemma import GemmaClient
 from app.schemas.assistant import CalendarEventSnapshot, UserPlanningMemory
-from app.services.assistant.cost_estimator import log_model_cost
 from app.services.assistant.plan_validator import validate_plan
 from app.services.assistant.planner import deterministic_plan
 from app.services.assistant.types import Constraint, CriticEvaluation, Deadline, ExtractedPlanningContext, FreeBlock, IntentClassification, PlanValidationResult, StructuredPlan
@@ -125,8 +121,8 @@ def deterministic_repair(
 
 
 class PlanRepairer:
-    def __init__(self, client: AsyncOpenAI | None = None):
-        self.client = client or AsyncOpenAI(api_key=settings.openai_api_key or "unused")
+    def __init__(self, client: object | None = None, gemma_client: GemmaClient | None = None):
+        self.gemma = gemma_client or GemmaClient()
 
     async def repair(
         self,
@@ -141,44 +137,54 @@ class PlanRepairer:
         original_request: str | None = None,
         critic: CriticEvaluation | None = None,
     ) -> StructuredPlan:
-        repaired = deterministic_repair(plan, free_blocks=free_blocks, deadlines=deadlines, constraints=constraints, critic=critic)
-        second = validate_plan(
-            repaired,
-            fixed_events=fixed_events,
-            deadlines=deadlines,
-            constraints=constraints,
-            memory=memory,
-            free_blocks=free_blocks,
-            inferred_target_hours=repaired.inferred_target_hours,
-        )
-        if second.valid or not settings.openai_api_key:
-            return repaired
-
+        fallback = deterministic_repair(plan, free_blocks=free_blocks, deadlines=deadlines, constraints=constraints, critic=critic)
+        fallback.intent = plan.intent
+        fallback.version = plan.version
+        fallback.supersedes_plan_id = plan.supersedes_plan_id
+        fallback.status = plan.status
+        fallback.requires_user_confirmation = True
+        fallback.calendar_actions = []
         payload = {
-            "plan": repaired.model_dump(mode="json"),
+            "plan": plan.model_dump(mode="json"),
             "validation_errors": [issue.model_dump() for issue in validation.issues],
             "critic": critic.model_dump(mode="json") if critic else None,
             "original_user_request": original_request,
             "free_blocks": [block.model_dump() for block in free_blocks[:80]],
             "deadlines": [deadline.model_dump() for deadline in deadlines],
             "constraints": [constraint.model_dump() for constraint in constraints],
+            "deterministic_baseline": fallback.model_dump(mode="json"),
         }
-        log_model_cost(
-            phase="repair",
-            model=settings.repair_model,
-            input_payload=payload,
+        gemma_json = await self.gemma.generate_json(
+            schema_name="StructuredPlanRepair",
+            system_prompt=(
+                "Repair the structured calendar plan using validation errors and critic instructions. "
+                "Return JSON matching StructuredPlan. Keep calendar_actions empty. Use only provided free blocks "
+                "and preserve the user's requested tasks."
+            ),
+            payload=payload,
             max_output_tokens=settings.planner_max_output_tokens,
         )
-        response = await self.client.chat.completions.create(
-            model=settings.repair_model,
-            messages=[
-                {"role": "system", "content": "Repair the structured calendar plan using validation errors and critic instructions. Return only JSON matching the original plan schema."},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            response_format={"type": "json_object"},
-            **completion_token_param(settings.repair_model, settings.planner_max_output_tokens),
-        )
-        try:
-            return StructuredPlan.model_validate_json(response.choices[0].message.content or "{}")
-        except Exception:
-            return repaired
+        if isinstance(gemma_json, dict):
+            gemma_json.setdefault("plan_id", plan.plan_id)
+            gemma_json.setdefault("status", plan.status)
+            gemma_json.setdefault("version", plan.version)
+            gemma_json.setdefault("created_at", plan.created_at)
+            gemma_json.setdefault("requires_user_confirmation", True)
+            gemma_json["calendar_actions"] = []
+            try:
+                repaired = StructuredPlan.model_validate(gemma_json)
+            except Exception:
+                repaired = None
+            if repaired is not None:
+                second = validate_plan(
+                    repaired,
+                    fixed_events=fixed_events,
+                    deadlines=deadlines,
+                    constraints=constraints,
+                    memory=memory,
+                    free_blocks=free_blocks,
+                    inferred_target_hours=repaired.inferred_target_hours,
+                )
+                if second.valid:
+                    return repaired
+        return fallback

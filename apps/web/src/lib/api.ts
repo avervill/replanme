@@ -184,9 +184,45 @@ export interface UserProfile {
   is_admin: boolean;
 }
 
+export interface OnboardingData {
+  role: string;
+  mainGoal: string | string[];
+  planningPain: string | string[];
+  energyProfile: {
+    peakFocusTime: string | string[];
+    lowEnergyTime: string | string[];
+    preferredWorkBlockLength: string | string[];
+    sleepPreference: string | string[];
+  };
+  calendarIntent: string;
+  firstPrompt: string;
+}
+
+export interface OnboardingStatus {
+  onboardingCompleted: boolean;
+  onboardingSkipped: boolean;
+  onboardingData: OnboardingData | Record<string, unknown> | null;
+}
+
 /** Fetch the current user profile */
 export async function fetchMe(): Promise<UserProfile> {
   return apiGet<UserProfile>("/auth/me");
+}
+
+export async function fetchOnboardingStatus(): Promise<OnboardingStatus> {
+  return apiGet<OnboardingStatus>("/onboarding/status");
+}
+
+export async function saveOnboarding(data: OnboardingData): Promise<OnboardingStatus> {
+  return apiPost<OnboardingStatus>("/onboarding/save", data);
+}
+
+export async function completeOnboarding(): Promise<OnboardingStatus> {
+  return apiPost<OnboardingStatus>("/onboarding/complete");
+}
+
+export async function skipOnboarding(): Promise<OnboardingStatus> {
+  return apiPost<OnboardingStatus>("/onboarding/skip");
 }
 
 export interface GoogleCalendarEvent {

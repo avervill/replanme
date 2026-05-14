@@ -1,10 +1,11 @@
 from fastapi import APIRouter
 
-from app.api.routes import admin, ai, auth, calendar, health, scheduling, subscription, uploads, vision, voice
+from app.api.routes import admin, ai, auth, calendar, health, onboarding, scheduling, subscription, uploads, vision, voice
 
 api_router = APIRouter()
 api_router.include_router(health.router, prefix="/health", tags=["health"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(onboarding.router, prefix="/onboarding", tags=["onboarding"])
 api_router.include_router(subscription.router, prefix="/subscription", tags=["subscription"])
 api_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 api_router.include_router(calendar.router, prefix="/calendar", tags=["calendar"])

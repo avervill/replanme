@@ -7,6 +7,8 @@ import { Navbar } from "@/components/navbar";
 import { AiChatPanel } from "@/components/ai-chat-panel";
 import { AccountSettingsModal } from "@/components/account-settings-modal";
 import { PaywallModal } from "@/components/paywall-modal";
+import { OnboardingFlow } from "@/components/onboarding/OnboardingFlow";
+import { useOnboarding } from "@/hooks/useOnboarding";
 import {
   ScheduleWorkspace,
   type CalendarView,
@@ -21,6 +23,8 @@ export function DashboardShell() {
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [paywall, setPaywall] = useState<PaywallPayload | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [reopenOnboarding, setReopenOnboarding] = useState(false);
+  const onboarding = useOnboarding(Boolean(user));
 
   useEffect(() => {
     if (!loading && !user) {
@@ -28,10 +32,33 @@ export function DashboardShell() {
     }
   }, [loading, router, user]);
 
-  if (loading || !user) {
+  if (loading || !user || onboarding.loading || (!onboarding.status && !onboarding.error)) {
     return (
       <div className="landing-page flex min-h-screen items-center justify-center">
-        <div className="h-10 w-10 animate-pulse rounded-full bg-[linear-gradient(135deg,var(--purple),var(--teal))]" />
+        <div className="w-[min(92vw,520px)] rounded-[1.5rem] border border-white/70 bg-white/60 p-6 shadow-[0_22px_70px_rgba(74,34,129,0.14)] backdrop-blur-xl">
+          <div className="h-3 w-28 animate-pulse rounded-full bg-[rgba(124,58,237,0.18)]" />
+          <div className="mt-5 h-8 w-3/4 animate-pulse rounded-full bg-[rgba(124,58,237,0.14)]" />
+          <div className="mt-3 h-4 w-full animate-pulse rounded-full bg-[rgba(20,184,166,0.13)]" />
+          <div className="mt-8 grid gap-3 sm:grid-cols-2">
+            <div className="h-20 animate-pulse rounded-2xl bg-white/70" />
+            <div className="h-20 animate-pulse rounded-2xl bg-white/70" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (onboarding.error && !onboarding.status) {
+    return (
+      <div className="landing-page flex min-h-screen items-center justify-center px-4">
+        <div className="dashboard-modal w-full max-w-md rounded-[1.5rem] p-6 text-center">
+          <p className="mini-label mx-auto">Setup check</p>
+          <h1 className="mt-4 max-w-none text-2xl">Could not load onboarding status</h1>
+          <p className="mt-3 text-sm font-semibold leading-6 text-[rgba(60,44,96,0.68)]">{onboarding.error}</p>
+          <button type="button" onClick={() => void onboarding.refresh()} className="primary-button mt-6 min-h-11 px-5">
+            Retry
+          </button>
+        </div>
       </div>
     );
   }
@@ -71,8 +98,28 @@ export function DashboardShell() {
           </div>
         )}
       </main>
-      {settingsOpen && <AccountSettingsModal user={user} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <AccountSettingsModal
+          user={user}
+          onClose={() => setSettingsOpen(false)}
+          onOpenOnboarding={() => {
+            setSettingsOpen(false);
+            setReopenOnboarding(true);
+          }}
+        />
+      )}
       <PaywallModal paywall={paywall} onClose={() => setPaywall(null)} />
+      {(onboarding.shouldShowOnboarding || reopenOnboarding) && (
+        <OnboardingFlow
+          user={user}
+          mode={reopenOnboarding ? "settings" : "first-run"}
+          onClose={reopenOnboarding ? () => setReopenOnboarding(false) : undefined}
+          onFinished={() => {
+            setReopenOnboarding(false);
+            void onboarding.refresh();
+          }}
+        />
+      )}
     </div>
   );
 }

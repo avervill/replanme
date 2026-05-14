@@ -7,6 +7,7 @@ import type { UserProfile } from "@/lib/api";
 type AccountSettingsModalProps = {
   user: UserProfile;
   onClose: () => void;
+  onOpenOnboarding?: () => void;
 };
 
 const usageRows: Array<[keyof SubscriptionUsageResponse["usage"], string]> = [
@@ -26,7 +27,7 @@ function formatMetric(metric: { used: number; limit: number | null; allowed: boo
   return `${metric.used} / ${metric.limit} used this month`;
 }
 
-export function AccountSettingsModal({ user, onClose }: AccountSettingsModalProps) {
+export function AccountSettingsModal({ user, onClose, onOpenOnboarding }: AccountSettingsModalProps) {
   const [usage, setUsage] = useState<SubscriptionUsageResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -73,6 +74,22 @@ export function AccountSettingsModal({ user, onClose }: AccountSettingsModalProp
             Planning credits: {usage?.planningCredits ?? user.planning_credits}
           </p>
         </div>
+
+        {onOpenOnboarding && (
+          <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-[rgba(20,184,166,0.18)] bg-[rgba(20,184,166,0.08)] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-calm-text">Planning setup</p>
+              <p className="mt-1 text-sm text-calm-muted">Revisit your role, planning pain, energy profile, and first-plan prompt.</p>
+            </div>
+            <button
+              type="button"
+              onClick={onOpenOnboarding}
+              className="rounded-xl border border-[rgba(20,184,166,0.24)] bg-white/70 px-4 py-2 text-sm font-semibold text-calm-text transition hover:bg-white"
+            >
+              Reopen onboarding
+            </button>
+          </div>
+        )}
 
         {error ? (
           <p className="mt-5 rounded-2xl border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-700">

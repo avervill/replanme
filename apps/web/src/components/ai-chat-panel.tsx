@@ -1,9 +1,12 @@
 "use client";
 
 import { KeyboardEvent, useEffect, useRef, useState, FormEvent } from "react";
-import { isPaywallError, sendAssistantMessage, fetchChatHistory, clearChatHistory, type AssistantResponse, type PaywallPayload } from "@/lib/api";
+import { isPaywallError, sendAssistantMessage, fetchChatHistory, clearChatHistory, type PaywallPayload, type UploadedFileResponse } from "@/lib/api";
 import { ensureStringMessage } from "@/lib/assistant-message";
 import { useAuth } from "@/lib/auth";
+import { PENDING_INITIAL_ATTACHMENTS_KEY, PENDING_INITIAL_PROMPT_ID_KEY, PENDING_INITIAL_PROMPT_KEY } from "@/hooks/useOnboarding";
+import { useAiPromptTools } from "@/hooks/useAiPromptTools";
+import { AiPromptTools } from "@/components/ai-prompt-tools";
 import type { CalendarView } from "@/components/schedule-workspace";
 
 type AiChatPanelProps = {
@@ -21,6 +24,7 @@ type ChatMessage = {
   pendingText?: string; // e.g. "Thinking...", "Planning your week..."
   awaitingConfirmation?: boolean;
   confirmationToken?: string | null;
+  attachments?: UploadedFileResponse[];
 };
 
 const SESSION_STORAGE_KEY = "replanme_assistant_session";
@@ -42,6 +46,16 @@ const getPendingText = (input: string) => {
   return "Thinking...";
 };
 
+const readPendingInitialAttachments = () => {
+  try {
+    const raw = window.localStorage.getItem(PENDING_INITIAL_ATTACHMENTS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed as UploadedFileResponse[] : [];
+  } catch {
+    return [];
+  }
+};
+
 export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywall }: AiChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([starterMessage]);
   const [input, setInput] = useState("");
@@ -51,6 +65,11 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
   const { refresh } = useAuth();
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const consumedInitialPromptRef = useRef<string | null>(null);
+  const promptTools = useAiPromptTools({
+    onTranscript: (text) => setInput((current) => (current.trim() ? `${current.trim()} ${text}` : text)),
+    onPaywall,
+  });
 
   useEffect(() => {
     let nextId = "";
@@ -89,14 +108,20 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
     }
   }, [messages]);
 
-  const sendPrompt = async (promptValue: string) => {
-    const prompt = promptValue.trim();
-    if (!prompt || submitting) return;
+  const sendPrompt = async (
+    promptValue: string,
+    options?: { restoreOnError?: boolean; attachments?: UploadedFileResponse[] },
+  ) => {
+    const sentAttachments = options?.attachments ?? promptTools.attachments;
+    const typedPrompt = promptValue.trim();
+    const prompt = typedPrompt || (sentAttachments.length > 0 ? "Please analyze the attached file or image and help me plan from it." : "");
+    if (!prompt || submitting || promptTools.uploading) return;
 
     const userMessage: ChatMessage = {
       id: Date.now(),
       role: "user",
-      text: prompt,
+      text: typedPrompt || prompt,
+      attachments: sentAttachments,
     };
 
     const pendingMessageId = Date.now() + 1;
@@ -113,6 +138,9 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
       },
     ]);
     setInput("");
+    if (!options?.attachments) {
+      promptTools.clearAttachments();
+    }
     setSubmitting(true);
 
     try {
@@ -124,6 +152,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
         timezone,
         session_id: activeSessionId,
         preview: false,
+        attachments: sentAttachments,
       });
 
       if (response.status === "completed") {
@@ -156,6 +185,10 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
       if (isPaywallError(error)) {
         onPaywall?.(error.payload);
       }
+      if (options?.restoreOnError) {
+        setInput(typedPrompt);
+        inputRef.current?.focus();
+      }
       setMessages((current) =>
         current.map((msg) =>
           msg.id === pendingMessageId
@@ -175,6 +208,21 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
       setSubmitting(false);
     }
   };
+
+  useEffect(() => {
+    if (loadingHistory || submitting || !sessionId) return;
+    const prompt = window.localStorage.getItem(PENDING_INITIAL_PROMPT_KEY);
+    const promptId = window.localStorage.getItem(PENDING_INITIAL_PROMPT_ID_KEY) || prompt;
+    if (!prompt || !promptId || consumedInitialPromptRef.current === promptId) return;
+    const attachments = readPendingInitialAttachments();
+
+    consumedInitialPromptRef.current = promptId;
+    window.localStorage.removeItem(PENDING_INITIAL_PROMPT_KEY);
+    window.localStorage.removeItem(PENDING_INITIAL_PROMPT_ID_KEY);
+    window.localStorage.removeItem(PENDING_INITIAL_ATTACHMENTS_KEY);
+
+    void sendPrompt(prompt, { restoreOnError: true, attachments });
+  }, [loadingHistory, sessionId, submitting]);
 
   const handleConfirmation = async (messageId: number) => {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -321,6 +369,16 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
               </div>
             )}
 
+            {message.attachments && message.attachments.length > 0 && !message.pendingText && (
+              <div className="mt-2 flex flex-wrap gap-2 pl-2">
+                {message.attachments.map((attachment) => (
+                  <span key={attachment.id} className="rounded-xl border border-[rgba(124,58,237,0.12)] bg-white/70 px-3 py-1 text-xs font-bold text-[rgba(60,44,96,0.62)]">
+                    {attachment.filename}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {message.awaitingConfirmation && !message.pendingText && (
               <div className="mt-3 pl-2">
                 <button
@@ -344,6 +402,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
             id="planner-prompt"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={promptTools.handlePaste}
             onKeyDown={handlePromptKeyDown}
             rows={1}
             placeholder="E.g., Move tomorrow's sync to Thursday..."
@@ -351,7 +410,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
           />
           <button
             type="submit"
-            disabled={submitting || !input.trim()}
+            disabled={submitting || promptTools.uploading || (!input.trim() && promptTools.attachments.length === 0)}
             className="dashboard-send-button"
             aria-label="Send message"
           >
@@ -360,6 +419,20 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
             </svg>
           </button>
         </div>
+        <AiPromptTools
+          attachments={promptTools.attachments}
+          disabled={submitting}
+          error={promptTools.error}
+          fileInputRef={promptTools.fileInputRef}
+          onFilesSelected={(files) => void promptTools.uploadFiles(files)}
+          onOpenFilePicker={promptTools.openFilePicker}
+          onRemoveAttachment={promptTools.removeAttachment}
+          onToggleRecording={() => void promptTools.toggleRecording()}
+          recording={promptTools.recording}
+          transcribing={promptTools.transcribing}
+          uploading={promptTools.uploading}
+          uploadProgress={promptTools.uploadProgress}
+        />
       </form>
     </aside>
   );

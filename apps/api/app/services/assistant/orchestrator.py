@@ -175,6 +175,7 @@ class AgentGraphState(TypedDict, total=False):
     history: list[dict[str, Any]]
     conversation_state: Any
     planning_state: dict[str, Any] | None
+    onboarding_profile: str
     route: RouteDecision
     selected_tools: tuple[str, ...]
     messages: list[dict[str, Any]]
@@ -468,6 +469,82 @@ def _preview_from_payload(value: Any) -> list[PlanPreviewChange]:
     return list(getattr(value, "preview", []) or [])
 
 
+def _key_value(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _dedupe_preview(preview: list[PlanPreviewChange]) -> list[PlanPreviewChange]:
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[PlanPreviewChange] = []
+    for item in preview:
+        key = (
+            item.action,
+            item.title.strip().casefold(),
+            _key_value(item.proposed_start_at or item.current_start_at),
+            _key_value(item.proposed_end_at),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _tool_call_key(call: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    args = dict(call.get("args") or {})
+    return (
+        str(call.get("name") or ""),
+        str(args.get("event_id") or args.get("match_title") or args.get("title") or "").strip().casefold(),
+        _key_value(args.get("start_at") or args.get("new_start_at") or args.get("source_start_at")),
+        _key_value(args.get("end_at") or args.get("new_end_at") or args.get("source_end_at")),
+        str(args.get("query") or args.get("title_contains") or "").strip().casefold(),
+    )
+
+
+def _dedupe_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for call in calls:
+        key = _tool_call_key(call)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(call)
+    return deduped
+
+
+def _compact_onboarding_profile(data: Any) -> str:
+    if not isinstance(data, dict) or not data:
+        return ""
+
+    def value_text(value: Any) -> str:
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value if item)
+        return str(value) if value else ""
+
+    energy = data.get("energyProfile") if isinstance(data.get("energyProfile"), dict) else {}
+    lines = ["Onboarding profile:"]
+    fields = [
+        ("role", data.get("role")),
+        ("main goal", data.get("mainGoal")),
+        ("planning pain", data.get("planningPain")),
+        ("peak focus", energy.get("peakFocusTime")),
+        ("low energy", energy.get("lowEnergyTime")),
+        ("work block", energy.get("preferredWorkBlockLength")),
+        ("sleep", energy.get("sleepPreference")),
+        ("calendar intent", data.get("calendarIntent")),
+    ]
+    for label, value in fields:
+        text = value_text(value)
+        if text:
+            lines.append(f"- {label}: {text}")
+    return "\n".join(lines)[:1200]
+
+
 def _public_tool_names(tool_names: list[str] | tuple[str, ...]) -> list[ToolName]:
     return [name for name in tool_names if name in TOOL_MODELS]  # type: ignore[list-item]
 
@@ -605,6 +682,7 @@ class AssistantOrchestrator:
                 "history": await memory_handler.get_history(),
                 "conversation_state": conversation_state,
                 "planning_state": conversation_state.planning_state,
+                "onboarding_profile": _compact_onboarding_profile(getattr(user, "onboarding_data", None)),
             }
         )
         return state
@@ -921,8 +999,11 @@ class AssistantOrchestrator:
                     if item.get("success") and item.get("tool") in MUTATING_TOOLS
                 ]
             )
+            preview = _dedupe_preview(preview)
+            pending_calls = _dedupe_tool_calls(pending_calls)
             if not pending_calls and route.intent == "optimize_schedule":
                 pending_calls = await self._pending_moves_from_optimization(state, results)
+                pending_calls = _dedupe_tool_calls(pending_calls)
             if pending_calls:
                 token = uuid.uuid4().hex
                 await self._save_pending(
@@ -1024,8 +1105,11 @@ class AssistantOrchestrator:
             preview.extend(_preview_from_payload(result))
             if item.get("success") and item.get("tool") in MUTATING_TOOLS:
                 pending_calls.append(ToolCallPlan(name=item["tool"], args=self._undry_args(item["tool"], result)).model_dump(mode="json"))
+        preview = _dedupe_preview(preview)
+        pending_calls = _dedupe_tool_calls(pending_calls)
         if not pending_calls and _intent_from_tool_names(tool_names) == "optimize_schedule":
             pending_calls = await self._pending_moves_from_optimization(state, results)
+            pending_calls = _dedupe_tool_calls(pending_calls)
 
         errors = [str(item["error"]) for item in tool_records if item.get("error")]
         intent = _intent_from_tool_names(tool_names)
@@ -1043,6 +1127,7 @@ class AssistantOrchestrator:
     def _build_smart_model_messages(self, state: AgentGraphState, request: DelegateToSmarterModelInput) -> list[dict[str, Any]]:
         memory = state["memory"]
         reason = f" Delegation reason: {request.reason}." if request.reason else ""
+        onboarding = f"\n{state['onboarding_profile']}" if state.get("onboarding_profile") else ""
         system = (
             "You are the smarter planning and optimization model for replanme. "
             "Use calendar tools to inspect availability and draft changes. "
@@ -1051,6 +1136,7 @@ class AssistantOrchestrator:
             "If a tool returns validation_error or says a required field is missing, ask the user for that detail instead of retrying the same tool with guessed values. "
             f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
             f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
+            f"{onboarding}"
             f"{reason}"
         )
         messages = [{"role": "system", "content": system}]
@@ -1296,6 +1382,7 @@ class AssistantOrchestrator:
 
     def _build_messages(self, state: AgentGraphState) -> list[dict[str, Any]]:
         memory = state["memory"]
+        onboarding = f"\n{state['onboarding_profile']}" if state.get("onboarding_profile") else ""
         system = (
             "You are replanme's frontline calendar agent running on the cheap model. "
             "You decide whether to answer directly, call safe calendar tools, or call delegate_to_smarter_model. "
@@ -1307,6 +1394,7 @@ class AssistantOrchestrator:
             "If a tool reports a duplicate event, ask whether to keep both instead of retrying. "
             f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
             f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
+            f"{onboarding}"
         )
         messages = [{"role": "system", "content": system}]
         for message in state.get("history", []):

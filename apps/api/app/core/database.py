@@ -31,10 +31,10 @@ async def init_db() -> None:
     logger.info("Running init_db - creating tables if missing")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-        await _ensure_billing_columns(connection)
+        await _ensure_user_columns(connection)
 
 
-async def _ensure_billing_columns(connection) -> None:
+async def _ensure_user_columns(connection) -> None:
     """Dev-only compatibility for existing local databases.
 
     ``create_all`` creates missing tables but does not add new columns to an
@@ -51,12 +51,14 @@ async def _ensure_billing_columns(connection) -> None:
     existing = await connection.run_sync(existing_user_columns)
     if not existing:
         return
+    had_onboarding_columns = "onboarding_completed" in existing
 
     period_end_type = (
         "TIMESTAMP WITH TIME ZONE"
         if connection.dialect.name == "postgresql"
         else "DATETIME"
     )
+    json_type = "JSONB" if connection.dialect.name == "postgresql" else "JSON"
     boolean_false = "false" if connection.dialect.name == "postgresql" else "0"
     columns = {
         "plan": "ALTER TABLE users ADD COLUMN plan VARCHAR(16) NOT NULL DEFAULT 'free'",
@@ -76,8 +78,29 @@ async def _ensure_billing_columns(connection) -> None:
         ),
         "stripe_customer_id": "ALTER TABLE users ADD COLUMN stripe_customer_id VARCHAR(255)",
         "stripe_subscription_id": "ALTER TABLE users ADD COLUMN stripe_subscription_id VARCHAR(255)",
+        "onboarding_completed": (
+            f"ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN NOT NULL DEFAULT {boolean_false}"
+        ),
+        "onboarding_completed_at": (
+            f"ALTER TABLE users ADD COLUMN onboarding_completed_at {period_end_type}"
+        ),
+        "onboarding_skipped": (
+            f"ALTER TABLE users ADD COLUMN onboarding_skipped BOOLEAN NOT NULL DEFAULT {boolean_false}"
+        ),
+        "onboarding_data": f"ALTER TABLE users ADD COLUMN onboarding_data {json_type}",
     }
     for column, statement in columns.items():
         if column not in existing:
             logger.info("Adding missing users.%s column", column)
             await connection.execute(text(statement))
+
+    if not had_onboarding_columns:
+        completed_true = "true" if connection.dialect.name == "postgresql" else "1"
+        await connection.execute(
+            text(
+                "UPDATE users SET onboarding_completed = "
+                f"{completed_true}, onboarding_completed_at = CURRENT_TIMESTAMP "
+                "WHERE onboarding_completed = "
+                f"{boolean_false}"
+            )
+        )

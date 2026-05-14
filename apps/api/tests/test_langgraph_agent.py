@@ -74,6 +74,29 @@ class FakeChatOpenAI:
         if has_tool_result:
             return FakeAIMessage("Draft ready.")
 
+        if "2,3,4,5" in prompt.casefold():
+            tool_calls = []
+            for repeat in range(2):
+                for index, (start_time, end_time) in enumerate(
+                    (("17:45", "18:15"), ("18:30", "19:00"), ("19:15", "19:45"), ("20:00", "20:30")),
+                    start=2,
+                ):
+                    tool_calls.append(
+                        {
+                            "id": f"complex-create-{repeat}-{index}",
+                            "name": "create_event",
+                            "args": {
+                                "title": "Pet Project",
+                                "description": "Planned by replanme AI.",
+                                "start_at": f"2026-05-14T{start_time}:00+00:00",
+                                "end_at": f"2026-05-14T{end_time}:00+00:00",
+                                "timezone": "UTC",
+                                "dry_run": True,
+                            },
+                        }
+                    )
+            return FakeAIMessage(tool_calls=tool_calls)
+
         title = "Planning block"
         if "pet project" in prompt.casefold():
             title = "Pet project work"
@@ -399,6 +422,29 @@ def test_few_next_days_returns_draft(monkeypatch):
     assert response.execution.preview
     assert "Tell me what you want to change" not in response.reply
     assert FakeChatOpenAI.model_calls == ["gpt-4o-mini", "gpt-5.4-mini"]
+
+
+def test_duplicate_model_tool_calls_are_deduped_before_confirmation(monkeypatch):
+    _install_fake_llm(monkeypatch)
+    registry = FakeRegistry()
+    assistant = _assistant(registry)
+
+    draft = _run(assistant, "lets do 2,3,4,5", session_id="dedupe")
+
+    assert draft.status == "awaiting_confirmation"
+    assert len(draft.execution.preview) == 4
+    assert draft.reply.count("Pet Project") == 4
+
+    confirmed = _run(
+        assistant,
+        "yes",
+        session_id="dedupe",
+        confirm=True,
+        confirmation_token=draft.confirmation_token,
+    )
+
+    assert confirmed.status == "completed"
+    assert len(registry.created) == 4
 
 
 def test_confirmation_executes_latest_pending_plan(monkeypatch):

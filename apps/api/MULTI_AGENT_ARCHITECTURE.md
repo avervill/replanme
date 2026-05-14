@@ -1,84 +1,24 @@
-# Multi-Agent Planning Architecture
+# LangGraph Assistant Architecture
 
-## Core Flow
+## Runtime
 
-1. `RouterAgent`
-   - Uses cheap heuristics first.
-   - Sends only uncertain or complex requests to GPT routing.
-   - Routes simple CRUD to Gemma.
+- `AssistantOrchestrator` is the central AI runtime for `/api/v1/ai/assistant`, `/ai/plan`, `/ai/create-event`, voice command parsing, and image import preview.
+- The first reasoning hop is always `gpt-4o-mini`.
+- `gpt-5.4-mini` is exposed to the frontline agent as the `delegate_to_smarter_model` tool for planning, optimization, conflict resolution, destructive actions, and batch changes.
+- Billing feature classification is deterministic and runs before the agent call.
 
-2. `PlannerAgent`
-   - GPT-only.
-   - Consumes prompt, memory, and bounded calendar context.
-   - Emits strict JSON `ExecutionPlan` objects.
+## Graph Flow
 
-3. `ExecutionAgent`
-   - Validates every plan step against typed tool inputs.
-   - Supports preview, dry-run, retry, rollback, and confirmation gating.
+1. Load conversation state, memory, timezone, pending confirmation, and compact chat history.
+2. Resolve pending confirmations or rejections from Redis-backed conversation state.
+3. Build the `gpt-4o-mini` frontend agent context and expose safe calendar tools plus `delegate_to_smarter_model`.
+4. Let the model decide whether to answer, call tools directly, or delegate to `gpt-5.4-mini`.
+5. Run selected tools against `AssistantToolRegistry`; delegated model mutations are forced to dry-run previews.
+6. Derive response routing metadata from actual tool usage and return the existing `AssistantMessageResponse` shape expected by the frontend.
 
-4. `PlanningMemoryService`
-   - Persists wake/sleep, work hours, focus windows, energy bands, priorities, and scheduling preferences.
+## Safety
 
-5. `AssistantToolRegistry`
-   - Typed tools:
-     - `create_event`
-     - `edit_event`
-     - `delete_event`
-     - `duplicate_events`
-     - `fetch_events`
-     - `move_event`
-     - `find_free_slots`
-     - `summarize_schedule`
-     - `detect_conflicts`
-     - `optimize_schedule`
-
-## Folder Structure
-
-```text
-apps/api/app/
-  api/routes/ai.py
-  models/planning_memory.py
-  schemas/assistant.py
-  services/assistant/
-    __init__.py
-    confidence.py
-    execution.py
-    json_utils.py
-    memory.py
-    orchestrator.py
-    planner.py
-    prompts.py
-    providers.py
-    router.py
-    tools.py
-```
-
-## Confirmation Flow
-
-1. Planner produces an `ExecutionPlan`.
-2. Execution agent builds a preview.
-3. Safety guard marks bulk/rescheduling/destructive changes as confirmable.
-4. Pending plan is stored in Redis with a TTL.
-5. Frontend sends `confirm=true` with the `confirmation_token`.
-6. Execution agent runs the stored plan with rollback protection.
-
-## Cost Strategy
-
-- Heuristics avoid GPT for obvious CRUD.
-- Gemma handles direct commands and response formatting.
-- GPT sees only bounded calendar context, not the entire calendar.
-- Preview path avoids unnecessary writes.
-
-## Example
-
-Prompt:
-
-`Duplicate this week into next week but move workouts to evenings and avoid conflicts with university.`
-
-Result:
-
-- Router -> `complex`
-- Planner -> fetch + duplicate + conflict-aware evening placement plan
-- Execution -> preview first
-- Safety -> confirmation required
-- Confirmation -> execute + optional memory writeback
+- Simple single-event creation can execute immediately.
+- Complex, destructive, bulk, conflict, and optimization flows run as previews first.
+- Previewed actions are stored in `ConversationState.planning_state` with a confirmation token.
+- The frontend applies changes by sending `confirm=true` and the token; stale tokens are rejected.

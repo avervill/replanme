@@ -1,62 +1,189 @@
-"""Production-oriented assistant orchestration.
+"""LangGraph-based assistant orchestration.
 
-This layer handles planning-first behavior with durable planning state, safe
-confirmation, model routing, compact calendar context, validation, and credit
-metadata. Non-planning calendar operations are delegated to the existing agent
-so current calendar functionality stays intact.
+The public API shape stays stable while the implementation is a single graph
+runtime where the cheap model is the first reasoning hop:
+
+* gpt-4o-mini receives the user message first and chooses tools.
+* gpt-5.4-mini is exposed as a delegate_to_smarter_model tool.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import uuid
 import zoneinfo
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, TypedDict
 
-from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.llm.agent import PlannerAgent as LegacyPlannerAgent
-from app.llm.memory import AgentMemoryHandler
 from app.models.user import User
 from app.schemas.assistant import (
     AssistantMessageRequest,
     AssistantMessageResponse,
+    BatchDeleteEventsInput,
+    BatchMoveEventsInput,
     CalendarEventSnapshot,
     CreateEventInput,
+    DeleteEventInput,
+    DetectConflictsInput,
     DisplayAction,
+    DuplicateEventsInput,
+    EditEventInput,
+    ExecutionLogEntry,
     ExecutionPlan,
+    FetchEventsInput,
+    FindFreeSlotsInput,
+    MoveEventInput,
+    OptimizeScheduleInput,
+    ParseScheduleImageInput,
+    ParseScheduleImageResult,
     PlanExecutionResult,
     PlanPreviewChange,
     RoutingDecision,
     SafetyAssessment,
+    SummarizeScheduleInput,
+    ToolExecutionMetadata,
+    ToolName,
 )
-from app.services.assistant.calendar_context import build_calendar_context
-from app.services.assistant.constraint_extractor import ConstraintExtractor
-from app.services.assistant.cost_estimator import estimate_credit_cost
-from app.services.assistant.intent_classifier import IntentClassifier
+from app.services.assistant.conversation_memory import AgentMemoryHandler
 from app.services.assistant.memory import PlanningMemoryService
-from app.services.assistant.model_router import calculate_planning_complexity, select_planner_model
-from app.services.assistant.plan_critic import PlanCritic
-from app.services.assistant.plan_repair import PlanRepairer
-from app.services.assistant.plan_validator import validate_plan
-from app.services.assistant.planner import StructuredPlanner
-from app.services.assistant.planning_state import build_planning_state, load_planning_state, save_planning_state
 from app.services.assistant.state import ConversationStateStore
 from app.services.assistant.tools import AssistantToolRegistry
-from app.services.assistant.types import (
-    ComplexityInput,
-    IntentClassification,
-    PlanningState,
-    PlanValidationIssue,
-    PlanValidationResult,
-    PlanSession,
-    StructuredPlan,
-)
+
+try:  # pragma: no cover - exercised only when optional deps are installed
+    from langgraph.graph import END, START, StateGraph
+except Exception:  # pragma: no cover - local test environment may not install deps
+    END = "__end__"
+    START = "__start__"
+    StateGraph = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - exercised only when optional deps are installed
+    from langchain_openai import ChatOpenAI
+except Exception:  # pragma: no cover - local test environment may not install deps
+    ChatOpenAI = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+CalendarIntentName = Literal[
+    "simple_chat",
+    "create_single_event",
+    "delete_event",
+    "update_event",
+    "move_event",
+    "duplicate_event",
+    "generate_plan",
+    "optimize_schedule",
+    "answer_question",
+    "confirm_plan_to_calendar",
+    "reject_plan",
+]
+
+DELEGATE_TOOL = "delegate_to_smarter_model"
+
+TOOL_MODELS: dict[str, type[BaseModel]] = {
+    "create_event": CreateEventInput,
+    "edit_event": EditEventInput,
+    "delete_event": DeleteEventInput,
+    "duplicate_events": DuplicateEventsInput,
+    "fetch_events": FetchEventsInput,
+    "move_event": MoveEventInput,
+    "find_free_slots": FindFreeSlotsInput,
+    "summarize_schedule": SummarizeScheduleInput,
+    "detect_conflicts": DetectConflictsInput,
+    "optimize_schedule": OptimizeScheduleInput,
+    "batch_move_events": BatchMoveEventsInput,
+    "batch_delete_events": BatchDeleteEventsInput,
+    "parse_schedule_image": ParseScheduleImageInput,
+}
+
+MUTATING_TOOLS = {
+    "create_event",
+    "edit_event",
+    "delete_event",
+    "duplicate_events",
+    "move_event",
+    "batch_move_events",
+    "batch_delete_events",
+}
+
+FRONTLINE_TOOLS: tuple[str, ...] = (
+    "create_event",
+    "fetch_events",
+    "find_free_slots",
+    "summarize_schedule",
+    "parse_schedule_image",
+    DELEGATE_TOOL,
+)
+COMPLEX_TOOLS: tuple[str, ...] = tuple(TOOL_MODELS)
+
+YES_REPLIES = {"yes", "y", "ok", "okay", "sure", "confirm", "apply", "apply changes", "do it"}
+NO_REPLIES = {"no", "n", "cancel", "stop", "don't", "dont", "do not", "reject"}
+class RouteDecision(BaseModel):
+    intent: CalendarIntentName
+    route: Literal["simple", "complex"]
+    selected_model: str
+    confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+    complexity_score: float = Field(default=0.1, ge=0.0)
+    reason: str
+    candidate_tools: list[ToolName] = Field(default_factory=list)
+
+
+class ToolCallPlan(BaseModel):
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = None
+
+
+class DelegateToSmarterModelInput(BaseModel):
+    """Escalate complex calendar reasoning from the cheap frontline model."""
+
+    task: str = Field(description="The user's full task, including relevant context from the conversation.")
+    reason: str | None = Field(default=None, description="Why this needs deeper planning or optimization.")
+
+
+class SmartModelResult(BaseModel):
+    success: bool = True
+    answer: str = ""
+    intent: CalendarIntentName = "generate_plan"
+    selected_model: str = Field(default_factory=lambda: settings.ai_complex_model)
+    preview: list[PlanPreviewChange] = Field(default_factory=list)
+    planned_tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+
+
+ALL_TOOL_MODELS: dict[str, type[BaseModel]] = {
+    **TOOL_MODELS,
+    DELEGATE_TOOL: DelegateToSmarterModelInput,
+}
+
+
+class AgentGraphState(TypedDict, total=False):
+    payload: AssistantMessageRequest
+    user: User
+    db: AsyncSession
+    session_id: str
+    user_id: str
+    timezone: str
+    now: datetime
+    memory: Any
+    memory_handler: AgentMemoryHandler
+    history: list[dict[str, Any]]
+    conversation_state: Any
+    planning_state: dict[str, Any] | None
+    route: RouteDecision
+    selected_tools: tuple[str, ...]
+    messages: list[dict[str, Any]]
+    tool_calls: list[ToolCallPlan]
+    tool_results: list[dict[str, Any]]
+    planned_tool_calls: list[dict[str, Any]]
+    answer: str
+    response: AssistantMessageResponse
+    loop_count: int
+    delegated_to_smarter_model: bool
 
 
 def _calendar_intent(intent: str) -> str:
@@ -66,40 +193,292 @@ def _calendar_intent(intent: str) -> str:
         "update_event": "UPDATE_EVENT",
         "move_event": "MOVE_EVENT",
         "duplicate_event": "DUPLICATE_EVENTS",
-        "duplicate_period": "DUPLICATE_EVENTS",
         "generate_plan": "PLAN_PERIOD",
-        "modify_existing_plan": "PLAN_PERIOD",
         "optimize_schedule": "OPTIMIZE_SCHEDULE",
+        "answer_question": "SEARCH_EVENTS",
         "confirm_plan_to_calendar": "CONFIRMATION_YES",
         "reject_plan": "CONFIRMATION_NO",
-        "answer_question": "SEARCH_EVENTS",
-    }.get(intent, "CHAT")
+        "simple_chat": "CHAT",
+    }.get(intent, "UNKNOWN")
 
 
-def _format_session(session: PlanSession) -> str:
-    start = datetime.fromisoformat(session.start)
-    end = datetime.fromisoformat(session.end)
-    day = start.strftime("%A")
-    return f"{day} {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: {session.title}"
+def _compact_schema(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _compact_schema(item)
+            for key, item in value.items()
+            if key not in {"title", "examples", "default"}
+        }
+    if isinstance(value, list):
+        return [_compact_schema(item) for item in value]
+    return value
 
 
-def format_plan_message(plan: StructuredPlan) -> str:
-    lines = [plan.summary, "", "Plan:"]
-    if plan.sessions:
-        lines.extend(_format_session(session) for session in plan.sessions)
-    else:
-        lines.append("No schedulable sessions found in the selected window.")
-    if plan.assumptions:
-        lines.append("")
-        lines.append("Assumptions:")
-        lines.extend(f"- {assumption}" for assumption in plan.assumptions[:4])
-    if plan.warnings:
-        lines.append("")
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in plan.warnings[:4])
-    lines.append("")
-    lines.append("Should I add this to your calendar?")
+def _tool_specs(tool_names: tuple[str, ...]) -> list[dict[str, Any]]:
+    specs = []
+    for name in tool_names:
+        model = ALL_TOOL_MODELS[name]
+        schema = _compact_schema(model.model_json_schema())
+        specs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": schema.get("description") or f"Execute {name} on the user's calendar.",
+                    "parameters": schema,
+                },
+            }
+        )
+    return specs
+
+
+def _prompt_norm(prompt: str) -> str:
+    return re.sub(r"\s+", " ", prompt.strip().casefold())
+
+
+def _is_yes(prompt: str) -> bool:
+    normalized = _prompt_norm(prompt).strip(".! ")
+    return normalized in YES_REPLIES or normalized.startswith(("yes ", "ok ", "okay ", "sure "))
+
+
+def _is_no(prompt: str) -> bool:
+    normalized = _prompt_norm(prompt).strip(".! ")
+    return normalized in NO_REPLIES or normalized.startswith(("no ", "cancel "))
+
+
+def _safe_zoneinfo(timezone: str):
+    try:
+        return zoneinfo.ZoneInfo(timezone)
+    except Exception:
+        return UTC
+
+
+def _format_events(events: list[CalendarEventSnapshot]) -> str:
+    if not events:
+        return "I don't see any events in that window."
+    lines = ["Here is what I found:"]
+    for event in events[:12]:
+        lines.append(f"- {event.title}: {event.start_at.strftime('%Y-%m-%d %H:%M')}-{event.end_at.strftime('%H:%M')}")
     return "\n".join(lines)
+
+
+def _extract_text(message: Any) -> str:
+    text = getattr(message, "text", None)
+    if callable(text):
+        value = text()
+        if isinstance(value, str):
+            return value
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+    return str(content or "")
+
+
+def _json_summary(value: Any, *, max_chars: int = 2000) -> str:
+    try:
+        if hasattr(value, "model_dump"):
+            payload = value.model_dump(mode="json")
+        else:
+            payload = value
+        return json.dumps(payload, ensure_ascii=True)[:max_chars]
+    except Exception:
+        return str(value)[:max_chars]
+
+
+def _compact_cell(value: Any, *, max_chars: int = 120) -> str:
+    text = "" if value is None else str(value)
+    text = " ".join(text.replace("|", "/").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _compact_dt(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else _compact_cell(value)
+
+
+def _compact_events_context(events: list[CalendarEventSnapshot], *, count: int | None, timezone: str) -> str:
+    total = count if count is not None else len(events)
+    lines = [
+        f"time zone: {timezone}",
+        f"events count: {total}",
+        "events:",
+        "title | st_datetime | end_datetime | desc",
+    ]
+    if not events:
+        lines.append("(none)")
+        return "\n".join(lines)
+    for event in events[:80]:
+        lines.append(
+            " | ".join(
+                (
+                    _compact_cell(event.title),
+                    _compact_dt(event.start_at),
+                    _compact_dt(event.end_at),
+                    _compact_cell(event.description),
+                )
+            )
+        )
+    if total > len(events):
+        lines.append(f"... {total - len(events)} more not shown")
+    return "\n".join(lines)
+
+
+def _compact_slots_context(value: Any, *, timezone: str) -> str:
+    slots = list(getattr(value, "slots", []) or [])
+    lines = [
+        f"time zone: {timezone}",
+        f"free slots count: {len(slots)}",
+        "free slots:",
+        "st_datetime | end_datetime | energy | score",
+    ]
+    if not slots:
+        lines.append("(none)")
+        return "\n".join(lines)
+    for slot in slots[:80]:
+        lines.append(
+            " | ".join(
+                (
+                    _compact_dt(slot.start_at),
+                    _compact_dt(slot.end_at),
+                    _compact_cell(getattr(slot, "energy_band", "")),
+                    _compact_cell(getattr(slot, "score", "")),
+                )
+            )
+        )
+    return "\n".join(lines)
+
+
+def _compact_preview_context(value: Any, *, timezone: str) -> str:
+    preview = _preview_from_payload(value)
+    lines = [
+        f"time zone: {timezone}",
+        f"preview count: {len(preview)}",
+        "preview:",
+        "action | title | st_datetime | end_datetime | details",
+    ]
+    if not preview:
+        lines.append("(none)")
+        return "\n".join(lines)
+    for item in preview[:80]:
+        lines.append(
+            " | ".join(
+                (
+                    _compact_cell(item.action),
+                    _compact_cell(item.title),
+                    _compact_dt(item.proposed_start_at or item.current_start_at or ""),
+                    _compact_dt(item.proposed_end_at or ""),
+                    _compact_cell(item.details),
+                )
+            )
+        )
+    return "\n".join(lines)
+
+
+def _compact_tool_result(value: Any, *, timezone: str, max_chars: int = 6000) -> str:
+    if isinstance(value, SmartModelResult):
+        lines = [
+            f"model: {value.selected_model}",
+            f"success: {value.success}",
+            f"intent: {value.intent}",
+            f"planned tool calls count: {len(value.planned_tool_calls)}",
+        ]
+        if value.answer:
+            lines.append(f"answer: {_compact_cell(value.answer, max_chars=1000)}")
+        if value.preview:
+            lines.append(_compact_preview_context(value, timezone=timezone))
+        return "\n".join(lines)[:max_chars]
+
+    if hasattr(value, "events"):
+        events = list(getattr(value, "events", []) or [])
+        count = getattr(value, "count", None)
+        if count is None:
+            count = getattr(value, "event_count", None)
+        summary = getattr(value, "summary", None)
+        header = f"summary: {_compact_cell(summary, max_chars=1000)}\n" if summary else ""
+        return (header + _compact_events_context(events, count=count, timezone=timezone))[:max_chars]
+
+    if hasattr(value, "slots"):
+        return _compact_slots_context(value, timezone=timezone)[:max_chars]
+
+    if _preview_from_payload(value):
+        return _compact_preview_context(value, timezone=timezone)[:max_chars]
+
+    return _json_summary(value, max_chars=max_chars)
+
+
+def _result_success(value: Any) -> bool:
+    return bool(getattr(value, "success", True))
+
+
+def _preview_from_payload(value: Any) -> list[PlanPreviewChange]:
+    return list(getattr(value, "preview", []) or [])
+
+
+def _public_tool_names(tool_names: list[str] | tuple[str, ...]) -> list[ToolName]:
+    return [name for name in tool_names if name in TOOL_MODELS]  # type: ignore[list-item]
+
+
+def _initial_agent_route() -> RouteDecision:
+    return RouteDecision(
+        intent="simple_chat",
+        route="simple",
+        selected_model=settings.ai_simple_model,
+        confidence=0.9,
+        complexity_score=0.1,
+        reason="Frontline model decides whether to answer, call calendar tools, or delegate to the smarter model.",
+        candidate_tools=_public_tool_names(FRONTLINE_TOOLS),
+    )
+
+
+def _confirmation_route(intent: CalendarIntentName) -> RouteDecision:
+    return RouteDecision(
+        intent=intent,
+        route="simple",
+        selected_model="backend",
+        confidence=1.0,
+        complexity_score=0.0,
+        reason="Backend confirmation token handling.",
+    )
+
+
+def _intent_from_tool_names(tool_names: list[str]) -> CalendarIntentName:
+    names = set(tool_names)
+    if "optimize_schedule" in names or "detect_conflicts" in names:
+        return "optimize_schedule"
+    if "batch_delete_events" in names or "delete_event" in names:
+        return "delete_event"
+    if "batch_move_events" in names or "move_event" in names:
+        return "move_event"
+    if "edit_event" in names:
+        return "update_event"
+    if "duplicate_events" in names:
+        return "duplicate_event"
+    if "create_event" in names:
+        return "generate_plan" if len([name for name in tool_names if name == "create_event"]) > 1 else "create_single_event"
+    if names & {"fetch_events", "find_free_slots", "summarize_schedule", "parse_schedule_image"}:
+        return "answer_question"
+    return "simple_chat"
+
+
+class _FallbackGraph:
+    def __init__(self, orchestrator: "AssistantOrchestrator"):
+        self.orchestrator = orchestrator
+
+    async def ainvoke(self, state: AgentGraphState) -> AgentGraphState:
+        state = await self.orchestrator._load_context_node(state)
+        if self.orchestrator._confirmation_condition(state) == "confirm":
+            state = await self.orchestrator._confirmation_node(state)
+            return state
+        state = await self.orchestrator._prepare_frontline_agent_node(state)
+        state = await self.orchestrator._agent_node(state)
+        while self.orchestrator._agent_condition(state) == "tools":
+            state = await self.orchestrator._tools_node(state)
+            state = await self.orchestrator._agent_node(state)
+        state = await self.orchestrator._finalize_node(state)
+        return state
 
 
 class AssistantOrchestrator:
@@ -113,206 +492,27 @@ class AssistantOrchestrator:
         self.state_store = state_store
         self.memory_service = memory_service
         self.registry = tool_registry
-        self.client = AsyncOpenAI(api_key=settings.openai_api_key or "unused")
-        self.intent_classifier = IntentClassifier(self.client)
-        self.constraint_extractor = ConstraintExtractor(self.client)
-        self.structured_planner = StructuredPlanner(self.client)
-        self.repairer = PlanRepairer(self.client)
-        self.critic = PlanCritic(self.client)
-        self.legacy = LegacyPlannerAgent(
-            state_store=state_store,
-            memory_service=memory_service,
-            tool_registry=tool_registry,
-        )
+        self.graph = self._compile_graph()
 
-    def _response(
-        self,
-        *,
-        session_id: str,
-        reply: str,
-        memory: Any,
-        classification: IntentClassification,
-        selected_model: str,
-        complexity_score: int,
-        credit_cost: float,
-        status: str = "completed",
-        execution: PlanExecutionResult | None = None,
-        requires_confirmation: bool = False,
-        confirmation_token: str | None = None,
-        display_actions: list[DisplayAction] | None = None,
-    ) -> AssistantMessageResponse:
-        return AssistantMessageResponse(
-            session_id=session_id,
-            status=status,  # type: ignore[arg-type]
-            reply=reply,
-            routing=RoutingDecision(
-                intent=_calendar_intent(classification.intent),  # type: ignore[arg-type]
-                route="complex" if classification.requires_planning else "simple",
-                selected_model=selected_model,
-                confidence=classification.confidence,
-                complexity_score=complexity_score,
-                use_calendar_context=classification.requires_calendar_read,
-                use_memory=True,
-                reason=classification.reason,
-                low_cost_path=selected_model in {"backend", settings.intent_model, settings.simple_action_model},
-            ),
-            plan=ExecutionPlan(
-                goal=classification.reason or reply,
-                summary=reply[:500],
-                selected_model=selected_model,
-                route="complex" if classification.requires_planning else "simple",
-                reasoning="Structured orchestration path.",
-                requires_confirmation=requires_confirmation,
-                confirmation_reason="Complex generated plans require confirmation before calendar insertion." if requires_confirmation else None,
-                response_message=reply,
-            ),
-            safety=SafetyAssessment(
-                requires_confirmation=requires_confirmation,
-                risk_level="high" if requires_confirmation else "low",
-            ),
-            execution=execution or PlanExecutionResult(status=status),  # type: ignore[arg-type]
-            display_actions=display_actions or [],
-            awaiting_confirmation=requires_confirmation,
-            confirmation_token=confirmation_token,
-            estimated_credit_cost=credit_cost,
-            model_used=selected_model,
-            complexity_score=float(complexity_score),
-            memory=memory,
-        )
+    def _compile_graph(self):
+        if StateGraph is None:
+            return _FallbackGraph(self)
 
-    async def _confirm_plan(
-        self,
-        *,
-        session_id: str,
-        payload: AssistantMessageRequest,
-        user: User,
-        db: AsyncSession,
-        memory: Any,
-        planning_state: PlanningState,
-        classification: IntentClassification,
-    ) -> AssistantMessageResponse:
-        if not planning_state.latest_plan:
-            reply = "I don't have an active draft plan to add yet."
-            return self._response(
-                session_id=session_id,
-                reply=reply,
-                memory=memory,
-                classification=classification,
-                selected_model="backend",
-                complexity_score=0,
-                credit_cost=0,
-                execution=PlanExecutionResult(status="failed", error=reply),
-            )
-            
-        plan = planning_state.latest_plan
-        if plan.status == "applied_to_calendar":
-            reply = "This plan was already added."
-            return self._response(
-                session_id=session_id,
-                reply=reply,
-                memory=memory,
-                classification=classification,
-                selected_model="backend",
-                complexity_score=0,
-                credit_cost=0,
-                execution=PlanExecutionResult(status="completed", error=reply),
-            )
-            
-        if plan.status == "superseded" or (payload.confirmation_token and payload.confirmation_token != plan.plan_id):
-            logger.warning("assistant.confirm_plan_mismatch", extra={"token": payload.confirmation_token, "latest": plan.plan_id, "status": plan.status})
-            reply = "I found multiple draft plans and could not safely determine which one to add. Please confirm the latest plan again."
-            return self._response(
-                session_id=session_id,
-                reply=reply,
-                memory=memory,
-                classification=classification,
-                selected_model="backend",
-                complexity_score=0,
-                credit_cost=0,
-                execution=PlanExecutionResult(status="failed", error=reply),
-            )
-            
-        if plan.status != "active_unconfirmed":
-            reply = "This plan cannot be confirmed right now."
-            return self._response(
-                session_id=session_id,
-                reply=reply,
-                memory=memory,
-                classification=classification,
-                selected_model="backend",
-                complexity_score=0,
-                credit_cost=0,
-                execution=PlanExecutionResult(status="failed", error=reply),
-            )
-            
-        logger.info("assistant.plan_confirmation_received", extra={
-            "user_message": payload.prompt,
-            "resolved_plan_id": plan.plan_id,
-            "plan_version": plan.version,
-            "sessions_count": len(plan.sessions),
-        })
-
-        created: list[CalendarEventSnapshot] = []
-        errors: list[str] = []
-        for session in planning_state.latest_plan.sessions:
-            try:
-                result = await self.registry.create_event(
-                    CreateEventInput(
-                        title=session.title,
-                        description=session.description or session.reason_short,
-                        start_at=datetime.fromisoformat(session.start),
-                        end_at=datetime.fromisoformat(session.end),
-                        timezone=getattr(user, "timezone", "UTC") or "UTC",
-                    ),
-                    user=user,
-                    db=db,
-                    memory=memory,
-                )
-                created.extend(result.created_events)
-            except Exception as exc:
-                logger.warning("assistant.plan_create_event_failed", exc_info=True)
-                errors.append(f"{session.title}: {exc}")
-
-        planning_state.confirmed = bool(created)
-        planning_state.requires_confirmation = False
-        planning_state.active = False
-        planning_state.created_calendar_event_ids = [event.id for event in created]
-        if created:
-            planning_state.latest_plan.status = "applied_to_calendar"
-        planning_state.updated_at = datetime.now(UTC).isoformat()
-        await save_planning_state(
-            self.state_store,
-            user_id=str(user.id),
-            session_id=session_id,
-            planning_state=planning_state,
-        )
-
-        if created:
-            logger.info("assistant.calendar_events_created", extra={
-                "plan_id": plan.plan_id,
-                "created_count": len(created),
-                "created_event_ids": [e.id for e in created],
-            })
-
-        reply = f"Added {len(created)} planned session{'s' if len(created) != 1 else ''} to your calendar."
-        if errors:
-            reply += f" {len(errors)} session{'s' if len(errors) != 1 else ''} could not be added."
-        await AgentMemoryHandler(self.state_store, str(user.id), session_id).add_assistant_message(reply)
-        return self._response(
-            session_id=session_id,
-            reply=reply,
-            memory=memory,
-            classification=classification,
-            selected_model="backend",
-            complexity_score=0,
-            credit_cost=0.1 * len(created),
-            execution=PlanExecutionResult(
-                status="completed" if created else "failed",
-                executed_steps=len(created),
-                created_events=created,
-                error="; ".join(errors[:3]) if errors and not created else None,
-            ),
-        )
+        graph = StateGraph(AgentGraphState)
+        graph.add_node("load_context", self._load_context_node)
+        graph.add_node("confirmation", self._confirmation_node)
+        graph.add_node("prepare_frontline_agent", self._prepare_frontline_agent_node)
+        graph.add_node("agent", self._agent_node)
+        graph.add_node("tools", self._tools_node)
+        graph.add_node("finalize", self._finalize_node)
+        graph.add_edge(START, "load_context")
+        graph.add_conditional_edges("load_context", self._confirmation_condition, {"confirm": "confirmation", "prepare": "prepare_frontline_agent"})
+        graph.add_edge("confirmation", END)
+        graph.add_edge("prepare_frontline_agent", "agent")
+        graph.add_conditional_edges("agent", self._agent_condition, {"tools": "tools", "finalize": "finalize"})
+        graph.add_edge("tools", "agent")
+        graph.add_edge("finalize", END)
+        return graph.compile()
 
     async def handle_message(
         self,
@@ -322,262 +522,721 @@ class AssistantOrchestrator:
         db: AsyncSession,
     ) -> AssistantMessageResponse:
         session_id = payload.session_id or uuid.uuid4().hex
-        timezone_str = payload.timezone or getattr(user, "timezone", "UTC") or "UTC"
-        try:
-            tz = zoneinfo.ZoneInfo(timezone_str)
-        except Exception:
-            tz = UTC
-        now_local = datetime.now(tz)
+        initial: AgentGraphState = {
+            "payload": payload,
+            "user": user,
+            "db": db,
+            "session_id": session_id,
+            "loop_count": 0,
+        }
+        final = await self.graph.ainvoke(initial)
+        response = final.get("response")
+        if response is None:
+            raise RuntimeError("Assistant graph finished without a response")
+        return response
 
-        memory_response = await self.memory_service.get_memory(db, user)
+    async def _load_context_node(self, state: AgentGraphState) -> AgentGraphState:
+        payload = state["payload"]
+        user = state["user"]
+        session_id = state["session_id"]
+        timezone = payload.timezone or getattr(user, "timezone", "UTC") or "UTC"
+        tzinfo = _safe_zoneinfo(timezone)
+        memory_response = await self.memory_service.get_memory(state.get("db"), user)
         memory_handler = AgentMemoryHandler(self.state_store, str(user.id), session_id)
-        planning_state = await load_planning_state(self.state_store, user_id=str(user.id), session_id=session_id)
-        classification = await self.intent_classifier.classify(
-            prompt=payload.prompt,
-            planning_state=planning_state,
-            attachments=payload.attachments,
+        conversation_state = await self.state_store.load(user_id=str(user.id), session_id=session_id)
+        state.update(
+            {
+                "user_id": str(user.id),
+                "timezone": timezone,
+                "now": datetime.now(tzinfo),
+                "memory": memory_response.memory,
+                "memory_handler": memory_handler,
+                "history": await memory_handler.get_history(),
+                "conversation_state": conversation_state,
+                "planning_state": conversation_state.planning_state,
+            }
         )
+        return state
 
-        if classification.intent == "reject_plan" and planning_state:
-            planning_state.active = False
-            planning_state.requires_confirmation = False
-            if planning_state.latest_plan:
-                planning_state.latest_plan.status = "rejected"
-            planning_state.updated_at = datetime.now(UTC).isoformat()
-            await save_planning_state(self.state_store, user_id=str(user.id), session_id=session_id, planning_state=planning_state)
-            reply = "Okay, I won't add that plan to your calendar."
-            await memory_handler.add_user_message(payload.prompt)
+    def _confirmation_condition(self, state: AgentGraphState) -> str:
+        payload = state["payload"]
+        planning_state = state.get("planning_state") or {}
+        has_pending = bool(planning_state.get("active") and planning_state.get("status") in {"active_unconfirmed", "awaiting_confirmation"})
+        if payload.confirm or payload.confirmation_token or (has_pending and (_is_yes(payload.prompt) or _is_no(payload.prompt))):
+            return "confirm"
+        return "prepare"
+
+    async def _confirmation_node(self, state: AgentGraphState) -> AgentGraphState:
+        payload = state["payload"]
+        planning_state = state.get("planning_state") or {}
+        memory_handler = state["memory_handler"]
+        await memory_handler.add_user_message(payload.prompt or "yes")
+
+        route = _confirmation_route("reject_plan" if _is_no(payload.prompt) else "confirm_plan_to_calendar")
+        if _is_no(payload.prompt):
+            planning_state["active"] = False
+            planning_state["status"] = "rejected"
+            await self._save_planning_state(state, planning_state)
+            reply = "Okay, I won't apply those calendar changes."
             await memory_handler.add_assistant_message(reply)
-            return self._response(
-                session_id=session_id,
+            state["response"] = self._response(
+                state=state,
                 reply=reply,
-                memory=memory_response.memory,
-                classification=classification,
-                selected_model="backend",
-                complexity_score=0,
-                credit_cost=0,
+                route=route,
+                status="completed",
+                execution=PlanExecutionResult(status="completed"),
             )
+            return state
 
-        is_confirm = classification.intent == "confirm_plan_to_calendar" or payload.confirmation_token
-        if is_confirm and planning_state and planning_state.latest_plan:
-            await memory_handler.add_user_message(payload.prompt or "yes")
-            return await self._confirm_plan(
-                session_id=session_id,
-                payload=payload,
-                user=user,
-                db=db,
-                memory=memory_response.memory,
-                planning_state=planning_state,
-                classification=classification,
-            )
-
-        if not classification.requires_planning:
-            response = await self.legacy.handle_message(payload=payload, user=user, db=db)
-            if not isinstance(response.reply, str):
-                response.reply = str(response.reply)
-            response.model_used = response.model_used or response.routing.selected_model
-            response.complexity_score = response.routing.complexity_score
-            return response
-
-        await memory_handler.add_user_message(payload.prompt)
-        extracted = await self.constraint_extractor.extract(
-            prompt=payload.prompt,
-            now=now_local,
-            planning_state=planning_state,
-        )
-        start_at = datetime.fromisoformat(extracted.planning_window_start or now_local.isoformat())
-        end_at = datetime.fromisoformat(extracted.planning_window_end or now_local.isoformat())
-        fixed_events, fixed_summary, free_blocks = await build_calendar_context(
-            registry=self.registry,
-            user=user,
-            db=db,
-            memory=memory_response.memory,
-            start_at=start_at,
-            end_at=end_at,
-            constraints=extracted.constraints,
-        )
-        complexity_input = ComplexityInput(
-            intent=classification.intent,
-            planning_window_days=extracted.planning_window_days,
-            fixed_events_count=len(fixed_events),
-            constraints_count=extracted.constraints_count,
-            deadlines_count=extracted.deadlines_count,
-            requires_energy_optimization=extracted.requires_energy_optimization,
-            requires_calendar_rewrite=extracted.requires_calendar_rewrite,
-            has_previous_plan_revision=classification.intent == "modify_existing_plan" and bool(planning_state),
-        )
-        complexity_score = calculate_planning_complexity(complexity_input)
-        selection = select_planner_model(complexity_score, user=user)
-        plan = await self.structured_planner.generate(
-            prompt=payload.prompt,
-            classification=classification,
-            extracted=extracted,
-            planning_state=planning_state,
-            fixed_events_summary=[event.model_dump(mode="json") for event in fixed_summary],
-            free_blocks=free_blocks,
-            model_selection=selection,
-        )
-
-        validation = PlanValidationResult(valid=True)
-        critic_result = None
-        critic_model_used = "none"
-        repair_attempts = 0
-        for attempt in range(settings.max_plan_repair_attempts + 1):
-            validation = validate_plan(
-                plan,
-                fixed_events=fixed_events,
-                deadlines=extracted.deadlines,
-                constraints=extracted.constraints,
-                memory=memory_response.memory,
-                intense_mode="intense" in payload.prompt.casefold() or "more" in payload.prompt.casefold(),
-                free_blocks=free_blocks,
-                inferred_target_hours=plan.inferred_target_hours,
-                recurring_tasks=extracted.recurring_tasks,
-            )
-            if (
-                classification.intent == "modify_existing_plan"
-                and planning_state
-                and planning_state.total_planned_hours is not None
-                and plan.total_planned_hours > planning_state.total_planned_hours
-            ):
-                remaining_issues = [issue for issue in validation.issues if issue.code != "insufficient_hours"]
-                if len(remaining_issues) != len(validation.issues):
-                    plan.warnings.append("Expanded the plan, but available calendar time may still be below the inferred target.")
-                    validation = PlanValidationResult(valid=not remaining_issues, issues=remaining_issues)
-            if not validation.valid:
-                if attempt >= settings.max_plan_repair_attempts:
-                    break
-                repair_attempts += 1
-                plan = await self.repairer.repair(
-                    plan=plan,
-                    validation=validation,
-                    free_blocks=free_blocks,
-                    fixed_events=fixed_events,
-                    deadlines=extracted.deadlines,
-                    constraints=extracted.constraints,
-                    memory=memory_response.memory,
-                    original_request=payload.prompt,
-                )
-                continue
-
-            critic_result, critic_model_used = await self.critic.evaluate(
-                user_request=payload.prompt,
-                plan=plan,
-                deadlines=extracted.deadlines,
-                constraints=extracted.constraints,
-                fixed_events=fixed_events,
-                free_blocks=free_blocks,
-                memory=memory_response.memory,
-                complexity_score=complexity_score,
-                recurring_tasks=extracted.recurring_tasks,
-            )
-            if critic_result.approved:
-                break
-            if attempt >= settings.max_plan_repair_attempts:
-                break
-            repair_attempts += 1
-            plan = await self.repairer.repair(
-                plan=plan,
-                validation=PlanValidationResult(
-                    valid=False,
-                    issues=[
-                        PlanValidationIssue(
-                            code="critic_rejected",
-                            message=critic_result.main_reason,
-                        )
-                    ],
-                ),
-                free_blocks=free_blocks,
-                fixed_events=fixed_events,
-                deadlines=extracted.deadlines,
-                constraints=extracted.constraints,
-                memory=memory_response.memory,
-                original_request=payload.prompt,
-                critic=critic_result,
-            )
-
-        if not validation.valid:
-            reply = "I drafted a plan, but it still has scheduling conflicts, so I did not show or apply it. Try widening the planning window or freeing a few calendar blocks."
+        token = payload.confirmation_token
+        pending_token = planning_state.get("pending_token")
+        if not planning_state or not planning_state.get("tool_calls"):
+            reply = "I don't have an active draft to apply."
             await memory_handler.add_assistant_message(reply)
-            return self._response(
-                session_id=session_id,
+            state["response"] = self._response(
+                state=state,
                 reply=reply,
-                memory=memory_response.memory,
-                classification=classification,
-                selected_model=selection.model,
-                complexity_score=complexity_score,
-                credit_cost=estimate_credit_cost(classification.intent, complexity_score, selection.model).estimated_credit_cost,
+                route=route,
                 status="failed",
-                execution=PlanExecutionResult(
-                    status="failed",
-                    error="; ".join(issue.message for issue in validation.issues[:4]),
-                ),
+                execution=PlanExecutionResult(status="failed", error=reply),
             )
-
-        if critic_result and not critic_result.approved:
-            plan.warnings.insert(
-                0,
-                f"Quality critic still flagged this plan after {repair_attempts} repair attempt(s): {critic_result.main_reason}",
+            return state
+        if token and pending_token and token != pending_token:
+            reply = "I found a newer draft and could not safely apply this older confirmation."
+            await memory_handler.add_assistant_message(reply)
+            state["response"] = self._response(
+                state=state,
+                reply=reply,
+                route=route,
+                status="failed",
+                execution=PlanExecutionResult(status="failed", error=reply),
             )
+            return state
+        if planning_state.get("status") == "applied_to_calendar":
+            reply = "This plan was already added."
+            await memory_handler.add_assistant_message(reply)
+            state["response"] = self._response(
+                state=state,
+                reply=reply,
+                route=route,
+                status="completed",
+                execution=PlanExecutionResult(status="completed"),
+            )
+            return state
 
-        logger.info(
-            "assistant.planning_quality_loop",
-            extra={
-                "planner_model_used": selection.model,
-                "critic_model_used": critic_model_used,
-                "validation_errors": [issue.code for issue in validation.issues],
-                "critic_score": critic_result.score if critic_result else None,
-                "critic_approved": critic_result.approved if critic_result else None,
-                "repair_attempts": repair_attempts,
-                "final_plan_total_hours": plan.total_planned_hours,
-                "estimated_cost_usd": 0.0,
-            },
-        )
+        results = []
+        errors = []
+        for raw_call in planning_state.get("tool_calls", []):
+            call = ToolCallPlan.model_validate(raw_call)
+            try:
+                results.append(await self._execute_tool(state, call.name, call.args, force_dry_run=False))
+            except Exception as exc:
+                logger.warning("assistant.confirmation_tool_failed", exc_info=True)
+                errors.append(f"{call.name}: {exc}")
 
-        if classification.intent == "modify_existing_plan" and planning_state and planning_state.latest_plan:
-            logger.info("assistant.plan_superseded", extra={"old_plan_id": planning_state.latest_plan.plan_id, "new_plan_id": plan.plan_id})
-            
-        logger.info("assistant.plan_generated", extra={"plan_id": plan.plan_id, "version": plan.version, "supersedes_plan_id": plan.supersedes_plan_id, "status": plan.status, "sessions_count": len(plan.sessions), "total_hours": plan.total_planned_hours})
+        execution = self._execution_from_results(results, status="completed" if not errors else "failed", error="; ".join(errors[:3]) or None)
+        if errors:
+            planning_state["status"] = "failed"
+            planning_state["active"] = False
+            await self._save_planning_state(state, planning_state)
+            reply = "I couldn't apply those changes cleanly."
+        else:
+            planning_state["status"] = "applied_to_calendar"
+            planning_state["active"] = False
+            await self._save_planning_state(state, planning_state)
+            created_count = len(execution.created_events)
+            updated_count = len(execution.updated_events)
+            deleted_count = len(execution.deleted_events)
+            parts = []
+            if created_count:
+                parts.append(f"created {created_count}")
+            if updated_count:
+                parts.append(f"updated {updated_count}")
+            if deleted_count:
+                parts.append(f"deleted {deleted_count}")
+            reply = "Applied changes: " + ", ".join(parts) + "." if parts else "Applied the draft changes."
 
-        next_state = build_planning_state(
-            goal=planning_state.goal if planning_state and planning_state.goal else payload.prompt,
-            latest_user_request=payload.prompt,
-            latest_plan=plan,
-            deadlines=extracted.deadlines,
-            constraints=extracted.constraints,
-            fixed_events_used=fixed_summary,
-            free_blocks_used=free_blocks,
-            target_hours=extracted.target_hours,
-        )
-        await save_planning_state(self.state_store, user_id=str(user.id), session_id=session_id, planning_state=next_state)
-        reply = format_plan_message(plan)
         await memory_handler.add_assistant_message(reply)
-        credit = estimate_credit_cost(classification.intent, complexity_score, selection.model)
-        preview = [
-            PlanPreviewChange(
-                action="create_event",
-                title=session.title,
-                details=session.reason_short,
-                proposed_start_at=datetime.fromisoformat(session.start),
-                proposed_end_at=datetime.fromisoformat(session.end),
-            )
-            for session in plan.sessions
-        ]
-        return self._response(
-            session_id=session_id,
+        state["response"] = self._response(
+            state=state,
             reply=reply,
-            memory=memory_response.memory,
-            classification=classification,
-            selected_model=selection.model,
-            complexity_score=complexity_score,
-            credit_cost=credit.estimated_credit_cost,
-            status="awaiting_confirmation",
-            requires_confirmation=True,
-            confirmation_token=plan.plan_id,
-            display_actions=[DisplayAction(kind="ask_user", summary="Add this draft plan to calendar after confirmation.")],
-            execution=PlanExecutionResult(
-                status="awaiting_confirmation",
-                preview=preview,
-                rollback_available=False,
-            ),
+            route=route,
+            status=execution.status,
+            execution=execution,
         )
+        return state
+
+    async def _prepare_frontline_agent_node(self, state: AgentGraphState) -> AgentGraphState:
+        payload = state["payload"]
+        route = _initial_agent_route()
+        state["route"] = route
+        state["selected_tools"] = FRONTLINE_TOOLS
+        state["messages"] = self._build_messages(state)
+        await state["memory_handler"].add_user_message(payload.prompt)
+        return state
+
+    async def _agent_node(self, state: AgentGraphState) -> AgentGraphState:
+        if state.get("response") is not None:
+            return state
+        if state.get("delegated_to_smarter_model"):
+            return state
+
+        if not self._can_call_llm():
+            state.setdefault("tool_results", []).append(
+                {
+                    "tool": "model",
+                    "error": "OpenAI API key is not configured; the LLM agent cannot run.",
+                    "success": False,
+                }
+            )
+            return state
+
+        route = state["route"]
+        tool_specs = _tool_specs(state["selected_tools"])
+        try:  # pragma: no cover - requires optional packages and API key
+            llm = ChatOpenAI(
+                model=route.selected_model,
+                api_key=settings.openai_api_key,
+            )
+            message = await llm.bind_tools(tool_specs).ainvoke(state["messages"])
+        except Exception as exc:
+            logger.warning("assistant.llm_failed", exc_info=True)
+            state.setdefault("tool_results", []).append({"tool": "model", "error": str(exc), "success": False})
+            return state
+
+        state["messages"].append(self._message_to_dict(message))
+        tool_calls = []
+        for item in getattr(message, "tool_calls", []) or []:
+            name = item.get("name")
+            if name in ALL_TOOL_MODELS:
+                tool_calls.append(ToolCallPlan(name=name, args=item.get("args") or {}, id=item.get("id")))  # type: ignore[arg-type]
+        if tool_calls:
+            state["tool_calls"] = tool_calls
+            return state
+        state["tool_calls"] = []
+        state["answer"] = _extract_text(message) or "Done."
+        return state
+
+    def _agent_condition(self, state: AgentGraphState) -> str:
+        if state.get("tool_calls") and state.get("loop_count", 0) < 4:
+            return "tools"
+        return "finalize"
+
+    def _update_route_from_tool_calls(self, state: AgentGraphState, calls: list[ToolCallPlan]) -> None:
+        if not calls:
+            return
+        names = [call.name for call in calls]
+        mutating_count = sum(1 for name in names if name in MUTATING_TOOLS)
+        if DELEGATE_TOOL in names:
+            state["route"] = RouteDecision(
+                intent="generate_plan",
+                route="complex",
+                selected_model=settings.ai_complex_model,
+                confidence=0.9,
+                complexity_score=6.0,
+                reason="The frontline model chose to delegate this request to the smarter model.",
+                candidate_tools=_public_tool_names(COMPLEX_TOOLS),
+            )
+            state["selected_tools"] = COMPLEX_TOOLS
+            return
+        intent = _intent_from_tool_names(names)
+        is_complex = mutating_count > 1 or any(name in {"edit_event", "delete_event", "duplicate_events", "move_event", "batch_move_events", "batch_delete_events"} for name in names)
+        state["route"] = RouteDecision(
+            intent=intent,
+            route="complex" if is_complex else "simple",
+            selected_model=state["route"].selected_model,
+            confidence=0.85,
+            complexity_score=5.0 if is_complex else 0.5,
+            reason="Routing metadata derived from tools selected by the model.",
+            candidate_tools=_public_tool_names(tuple(names)),
+        )
+
+    async def _tools_node(self, state: AgentGraphState) -> AgentGraphState:
+        calls = state.pop("tool_calls", [])
+        state["tool_calls"] = []
+        self._update_route_from_tool_calls(state, calls)
+        route = state["route"]
+        results = []
+        mutating_count = sum(1 for call in calls if call.name in MUTATING_TOOLS)
+        for call in calls:
+            try:
+                force_dry_run = call.name in MUTATING_TOOLS and (route.route == "complex" or mutating_count > 1)
+                result = await self._execute_tool(state, call.name, call.args, force_dry_run=force_dry_run)
+                if call.name == DELEGATE_TOOL and isinstance(result, SmartModelResult):
+                    state["delegated_to_smarter_model"] = True
+                    state["answer"] = result.answer
+                    state["planned_tool_calls"] = result.planned_tool_calls
+                    state["route"] = RouteDecision(
+                        intent=result.intent,
+                        route="complex",
+                        selected_model=result.selected_model,
+                        confidence=0.9,
+                        complexity_score=6.0,
+                        reason="The frontline model delegated this request to the smarter model.",
+                        candidate_tools=_public_tool_names(COMPLEX_TOOLS),
+                    )
+                success = _result_success(result)
+                record = {"tool": call.name, "result": result, "success": success}
+                if not success and getattr(result, "answer", None):
+                    record["error"] = str(result.answer)
+                results.append(record)
+                state["messages"].append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id or f"tool-{call.name}",
+                        "name": call.name,
+                        "content": _compact_tool_result(result, timezone=state["timezone"]),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("assistant.tool_failed", exc_info=True)
+                results.append({"tool": call.name, "error": str(exc), "success": False})
+                state["messages"].append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id or f"tool-{call.name}",
+                        "name": call.name,
+                        "content": json.dumps({"error": str(exc)}),
+                    }
+                )
+        state.setdefault("tool_results", []).extend(results)
+        state["loop_count"] = state.get("loop_count", 0) + 1
+        return state
+
+    async def _finalize_node(self, state: AgentGraphState) -> AgentGraphState:
+        if state.get("response") is not None:
+            return state
+
+        route = state["route"]
+        results = [item["result"] for item in state.get("tool_results", []) if item.get("result") is not None]
+        errors = [str(item["error"]) for item in state.get("tool_results", []) if item.get("error")]
+
+        if route.route == "complex" and results:
+            preview = []
+            pending_calls = list(state.get("planned_tool_calls", []) or [])
+            for item in state.get("tool_results", []):
+                if item.get("result") is not None:
+                    preview.extend(_preview_from_payload(item["result"]))
+            pending_calls.extend(
+                [
+                    ToolCallPlan(name=item["tool"], args=self._undry_args(item["tool"], item["result"])).model_dump(mode="json")
+                    for item in state.get("tool_results", [])
+                    if item.get("success") and item.get("tool") in MUTATING_TOOLS
+                ]
+            )
+            if not pending_calls and route.intent == "optimize_schedule":
+                pending_calls = await self._pending_moves_from_optimization(state, results)
+            if pending_calls:
+                token = uuid.uuid4().hex
+                await self._save_pending(
+                    state,
+                    token=token,
+                    route=route,
+                    tool_calls=pending_calls,
+                    preview=preview,
+                )
+                reply = self._preview_reply(route, preview)
+                await state["memory_handler"].add_assistant_message(reply)
+                state["response"] = self._response(
+                    state=state,
+                    reply=reply,
+                    route=route,
+                    status="awaiting_confirmation",
+                    execution=PlanExecutionResult(status="awaiting_confirmation", preview=preview),
+                    requires_confirmation=True,
+                    confirmation_token=token,
+                    display_actions=[DisplayAction(kind="ask_user", summary="Apply this draft after confirmation.")],
+                )
+                return state
+
+        execution = self._execution_from_results(results, status="failed" if errors else "completed", error="; ".join(errors[:3]) or None)
+        reply = self._reply_from_results(route, results, errors) if errors else state.get("answer") or self._reply_from_results(route, results, errors)
+        await state["memory_handler"].add_assistant_message(reply)
+        state["response"] = self._response(
+            state=state,
+            reply=reply,
+            route=route,
+            status=execution.status,
+            execution=execution,
+        )
+        return state
+
+    async def _delegate_to_smarter_model(self, state: AgentGraphState, request: DelegateToSmarterModelInput) -> SmartModelResult:
+        if not self._can_call_llm():
+            return SmartModelResult(
+                success=False,
+                answer="The smarter model is not configured.",
+                selected_model=settings.ai_complex_model,
+            )
+
+        messages = self._build_smart_model_messages(state, request)
+        tool_specs = _tool_specs(COMPLEX_TOOLS)
+        tool_records: list[dict[str, Any]] = []
+        answer = ""
+        try:  # pragma: no cover - external model call is exercised with fakes in tests
+            llm = ChatOpenAI(model=settings.ai_complex_model, api_key=settings.openai_api_key)
+            for _ in range(4):
+                message = await llm.bind_tools(tool_specs).ainvoke(messages)
+                messages.append(self._message_to_dict(message))
+                calls = [
+                    ToolCallPlan(name=item.get("name"), args=item.get("args") or {}, id=item.get("id"))  # type: ignore[arg-type]
+                    for item in getattr(message, "tool_calls", []) or []
+                    if item.get("name") in TOOL_MODELS
+                ]
+                if not calls:
+                    answer = _extract_text(message)
+                    break
+                for call in calls:
+                    try:
+                        result = await self._execute_tool(state, call.name, call.args, force_dry_run=call.name in MUTATING_TOOLS)
+                        tool_records.append({"tool": call.name, "result": result, "success": _result_success(result)})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id or f"smart-tool-{call.name}",
+                                "name": call.name,
+                                "content": _compact_tool_result(result, timezone=state["timezone"]),
+                            }
+                        )
+                    except Exception as exc:
+                        tool_records.append({"tool": call.name, "error": str(exc), "success": False})
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id or f"smart-tool-{call.name}",
+                                "name": call.name,
+                                "content": json.dumps({"error": str(exc)}),
+                            }
+                        )
+        except Exception as exc:
+            logger.warning("assistant.smarter_model_failed", exc_info=True)
+            return SmartModelResult(
+                success=False,
+                answer=f"I couldn't reach the smarter model: {exc}",
+                selected_model=settings.ai_complex_model,
+            )
+
+        results = [item["result"] for item in tool_records if item.get("result") is not None]
+        tool_names = [item["tool"] for item in tool_records if item.get("tool")]
+        preview: list[PlanPreviewChange] = []
+        pending_calls: list[dict[str, Any]] = []
+        for item in tool_records:
+            result = item.get("result")
+            if result is None:
+                continue
+            preview.extend(_preview_from_payload(result))
+            if item.get("success") and item.get("tool") in MUTATING_TOOLS:
+                pending_calls.append(ToolCallPlan(name=item["tool"], args=self._undry_args(item["tool"], result)).model_dump(mode="json"))
+        if not pending_calls and _intent_from_tool_names(tool_names) == "optimize_schedule":
+            pending_calls = await self._pending_moves_from_optimization(state, results)
+
+        errors = [str(item["error"]) for item in tool_records if item.get("error")]
+        intent = _intent_from_tool_names(tool_names)
+        if pending_calls and intent == "create_single_event":
+            intent = "generate_plan"
+        return SmartModelResult(
+            success=not errors,
+            answer=answer,
+            intent=intent,
+            selected_model=settings.ai_complex_model,
+            preview=preview,
+            planned_tool_calls=pending_calls,
+        )
+
+    def _build_smart_model_messages(self, state: AgentGraphState, request: DelegateToSmarterModelInput) -> list[dict[str, Any]]:
+        memory = state["memory"]
+        reason = f" Delegation reason: {request.reason}." if request.reason else ""
+        system = (
+            "You are the smarter planning and optimization model for replanme. "
+            "Use calendar tools to inspect availability and draft changes. "
+            "For every calendar mutation, call tools with dry_run=true; the backend will handle user confirmation before applying anything. "
+            "Do not ask the user to confirm inside this model call. "
+            f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
+            f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
+            f"{reason}"
+        )
+        messages = [{"role": "system", "content": system}]
+        for message in state.get("history", []):
+            if message.get("role") in {"user", "assistant"} and not message.get("tool_calls"):
+                messages.append({"role": message["role"], "content": str(message.get("content") or "")})
+        messages.append({"role": "user", "content": request.task or state["payload"].prompt})
+        return messages
+
+    async def _execute_tool(self, state: AgentGraphState, tool_name: str, tool_args: dict[str, Any], *, force_dry_run: bool) -> Any:
+        if tool_name == DELEGATE_TOOL:
+            request = DelegateToSmarterModelInput.model_validate(tool_args)
+            return await self._delegate_to_smarter_model(state, request)
+        if tool_name not in TOOL_MODELS:
+            raise ValueError(f"Unknown tool: {tool_name}")
+        if tool_name == "parse_schedule_image":
+            return self._parse_schedule_image(tool_args, state["payload"].attachments)
+        model = TOOL_MODELS[tool_name]
+        args = dict(tool_args)
+        if "timezone" in model.model_fields and not args.get("timezone"):
+            args["timezone"] = state["timezone"]
+        if force_dry_run and tool_name in MUTATING_TOOLS and "dry_run" in model.model_fields:
+            args["dry_run"] = True
+        validated = model.model_validate(args)
+        handler = getattr(self.registry, tool_name)
+        return await handler(validated, user=state["user"], db=state.get("db"), memory=state["memory"])
+
+    def _parse_schedule_image(self, tool_args: dict[str, Any], attachments: list[dict[str, Any]]) -> ParseScheduleImageResult:
+        requested_id = tool_args.get("attachment_id")
+        selected = None
+        for attachment in attachments or []:
+            if requested_id and attachment.get("id") != requested_id:
+                continue
+            if attachment.get("kind") == "image" or attachment.get("text_preview"):
+                selected = attachment
+                break
+        if selected is None and attachments:
+            selected = attachments[0]
+        text = str((selected or {}).get("text_preview") or "").strip()
+        lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
+        subjects = [line for line in lines if re.search(r"\b(subject|class|course|lesson)\b", line, re.IGNORECASE)]
+        topics = [line for line in lines if re.search(r"\b(topic|chapter|unit|module)\b", line, re.IGNORECASE)]
+        structure = [
+            line
+            for line in lines
+            if re.search(r"\b(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", line, re.IGNORECASE)
+            or re.search(r"\b\d{1,2}:\d{2}\b", line)
+        ]
+        return ParseScheduleImageResult(
+            success=bool(text),
+            metadata=ToolExecutionMetadata(tool="parse_schedule_image", executed=True),
+            attachment_id=(selected or {}).get("id"),
+            extracted_text=text[:1000],
+            subjects=subjects[:10] or structure[:5],
+            topics=topics[:20],
+            schedule_structure=structure[:20],
+        )
+
+    def _execution_from_results(self, results: list[Any], *, status: str, error: str | None = None) -> PlanExecutionResult:
+        preview: list[PlanPreviewChange] = []
+        created: list[CalendarEventSnapshot] = []
+        updated: list[CalendarEventSnapshot] = []
+        deleted: list[CalendarEventSnapshot] = []
+        logs: list[ExecutionLogEntry] = []
+        for index, result in enumerate(results, start=1):
+            tool = getattr(getattr(result, "metadata", None), "tool", "fetch_events")
+            success = _result_success(result)
+            logs.append(ExecutionLogEntry(step_id=f"step-{index}", tool=tool, success=success, details=_json_summary(result, max_chars=500)))  # type: ignore[arg-type]
+            preview.extend(_preview_from_payload(result))
+            created.extend(list(getattr(result, "created_events", []) or []))
+            duplicated = list(getattr(result, "duplicated_events", []) or [])
+            created.extend(duplicated)
+            for key in ("updated_event", "moved_event"):
+                value = getattr(result, key, None)
+                if value is not None:
+                    updated.append(value)
+            updated.extend(list(getattr(result, "moved_events", []) or []))
+            deleted.extend(list(getattr(result, "deleted_events", []) or []))
+        return PlanExecutionResult(
+            status=status,  # type: ignore[arg-type]
+            executed_steps=len(results),
+            preview=preview,
+            logs=logs,
+            rollback_available=bool(created or updated or deleted),
+            error=error,
+            created_events=created,
+            updated_events=updated,
+            deleted_events=deleted,
+        )
+
+    def _reply_from_results(self, route: RouteDecision, results: list[Any], errors: list[str]) -> str:
+        if errors:
+            return f"I couldn't complete that: {errors[0]}"
+        if route.intent == "answer_question":
+            events = []
+            for result in results:
+                events.extend(list(getattr(result, "events", []) or []))
+            return _format_events(events)
+        execution = self._execution_from_results(results, status="completed")
+        if execution.created_events:
+            return f"Added {len(execution.created_events)} event{'s' if len(execution.created_events) != 1 else ''}."
+        if execution.updated_events:
+            return f"Updated {len(execution.updated_events)} event{'s' if len(execution.updated_events) != 1 else ''}."
+        if execution.deleted_events:
+            return f"Deleted {len(execution.deleted_events)} event{'s' if len(execution.deleted_events) != 1 else ''}."
+        return "Done."
+
+    def _preview_reply(self, route: RouteDecision, preview: list[PlanPreviewChange]) -> str:
+        if not preview:
+            return "I drafted calendar changes. Should I apply them?"
+        label = "plan" if route.intent == "generate_plan" else "calendar changes"
+        lines = [f"I drafted this {label}:", ""]
+        for item in preview[:8]:
+            when = item.proposed_start_at.strftime("%Y-%m-%d %H:%M") if item.proposed_start_at else "pending time"
+            lines.append(f"- {item.title}: {when}")
+        lines.append("")
+        lines.append("Should I apply these changes to your calendar?")
+        return "\n".join(lines)
+
+    async def _pending_moves_from_optimization(self, state: AgentGraphState, results: list[Any]) -> list[dict[str, Any]]:
+        pending = []
+        for result in results:
+            for suggestion in list(getattr(result, "suggestions", []) or []):
+                fetch = await self._execute_tool(
+                    state,
+                    "fetch_events",
+                    {
+                        "start_at": suggestion.current_start_at.isoformat(),
+                        "end_at": (suggestion.current_start_at + timedelta(minutes=1)).isoformat(),
+                        "query": suggestion.title,
+                        "max_results": 5,
+                    },
+                    force_dry_run=False,
+                )
+                event = next((item for item in getattr(fetch, "events", []) if item.title == suggestion.title), None)
+                if event:
+                    pending.append(
+                        ToolCallPlan(
+                            name="move_event",
+                            args={
+                                "event_id": event.id,
+                                "new_start_at": suggestion.suggested_start_at.isoformat(),
+                                "new_end_at": suggestion.suggested_end_at.isoformat(),
+                                "timezone": state["timezone"],
+                                "dry_run": False,
+                            },
+                        ).model_dump(mode="json")
+                    )
+        return pending
+
+    def _undry_args(self, tool_name: str, result: Any) -> dict[str, Any]:
+        preview = _preview_from_payload(result)
+        if tool_name == "create_event" and getattr(result, "created_events", None):
+            event = result.created_events[0]
+            return {
+                "title": event.title,
+                "description": event.description,
+                "start_at": event.start_at.isoformat(),
+                "end_at": event.end_at.isoformat(),
+                "timezone": event.timezone,
+                "location": event.location,
+                "dry_run": False,
+            }
+        if tool_name == "delete_event" and getattr(result, "deleted_events", None):
+            first = result.deleted_events[0]
+            return {"event_id": first.id, "delete_all_matches": False, "dry_run": False}
+        if preview:
+            first = preview[0]
+            if tool_name == "move_event":
+                return {
+                    "match_title": first.title,
+                    "new_start_at": first.proposed_start_at.isoformat() if first.proposed_start_at else None,
+                    "new_end_at": first.proposed_end_at.isoformat() if first.proposed_end_at else None,
+                    "timezone": "UTC",
+                    "dry_run": False,
+                }
+        return {"dry_run": False}
+
+    async def _save_pending(
+        self,
+        state: AgentGraphState,
+        *,
+        token: str,
+        route: RouteDecision,
+        tool_calls: list[dict[str, Any]],
+        preview: list[PlanPreviewChange],
+    ) -> None:
+        pending = {
+            "active": True,
+            "kind": "langgraph_tool_batch",
+            "status": "active_unconfirmed",
+            "pending_token": token,
+            "intent": route.intent,
+            "route": route.route,
+            "selected_model": route.selected_model,
+            "tool_calls": tool_calls or state.get("planned_tool_calls", []),
+            "preview": [item.model_dump(mode="json") for item in preview],
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        await self._save_planning_state(state, pending)
+
+    async def _save_planning_state(self, state: AgentGraphState, planning_state: dict[str, Any]) -> None:
+        conversation_state = await self.state_store.load(user_id=state["user_id"], session_id=state["session_id"])
+        conversation_state.planning_state = planning_state
+        await self.state_store.save(user_id=state["user_id"], session_id=state["session_id"], state=conversation_state)
+
+    def _build_messages(self, state: AgentGraphState) -> list[dict[str, Any]]:
+        memory = state["memory"]
+        system = (
+            "You are replanme's frontline calendar agent running on the cheap model. "
+            "You decide whether to answer directly, call safe calendar tools, or call delegate_to_smarter_model. "
+            "Use delegate_to_smarter_model for multi-step planning, optimization, conflict resolution, batch changes, destructive changes, "
+            "or any request where deeper reasoning would make the result better. "
+            "Safe single event creation and calendar search can be handled directly with tools. "
+            "Never claim existing calendar events without calling a calendar read tool first. "
+            f"Current local time: {state['now'].isoformat()} ({state['timezone']}). "
+            f"User memory: wake {memory.wake_time}, sleep {memory.sleep_time}, work {memory.workday_start}-{memory.workday_end}."
+        )
+        messages = [{"role": "system", "content": system}]
+        for message in state.get("history", []):
+            if message.get("role") in {"user", "assistant"} and not message.get("tool_calls"):
+                messages.append({"role": message["role"], "content": str(message.get("content") or "")})
+        messages.append({"role": "user", "content": state["payload"].prompt})
+        return messages
+
+    def _message_to_dict(self, message: Any) -> dict[str, Any]:
+        if hasattr(message, "model_dump"):
+            return message.model_dump(exclude_none=True)
+        return {"role": "assistant", "content": _extract_text(message)}
+
+    def _response(
+        self,
+        *,
+        state: AgentGraphState,
+        reply: str,
+        route: RouteDecision,
+        status: str,
+        execution: PlanExecutionResult,
+        requires_confirmation: bool = False,
+        confirmation_token: str | None = None,
+        display_actions: list[DisplayAction] | None = None,
+    ) -> AssistantMessageResponse:
+        risk = "high" if requires_confirmation or route.route == "complex" and route.intent in {"delete_event", "move_event", "optimize_schedule"} else "low"
+        return AssistantMessageResponse(
+            session_id=state["session_id"],
+            status=status,  # type: ignore[arg-type]
+            reply=str(reply),
+            routing=RoutingDecision(
+                intent=_calendar_intent(route.intent),  # type: ignore[arg-type]
+                route=route.route,
+                selected_model=route.selected_model,
+                confidence=route.confidence,
+                complexity_score=route.complexity_score,
+                use_calendar_context=bool(route.candidate_tools),
+                use_memory=True,
+                reason=route.reason,
+                candidate_tools=route.candidate_tools,
+                low_cost_path=route.selected_model == settings.ai_simple_model,
+            ),
+            plan=ExecutionPlan(
+                goal=route.reason,
+                summary=reply[:500],
+                selected_model=route.selected_model,
+                route=route.route,
+                reasoning="LangGraph routed and executed this request.",
+                steps=[],
+                requires_confirmation=requires_confirmation,
+                confirmation_reason="Complex or risky calendar changes need confirmation." if requires_confirmation else None,
+                response_message=reply,
+            ),
+            safety=SafetyAssessment(
+                requires_confirmation=requires_confirmation,
+                risk_level=risk,  # type: ignore[arg-type]
+                impacted_events=len(execution.preview),
+            ),
+            execution=execution,
+            display_actions=display_actions or [],
+            awaiting_confirmation=requires_confirmation,
+            confirmation_token=confirmation_token,
+            estimated_credit_cost=3.0 if route.route == "complex" else 0.1 if route.intent == "create_single_event" else 0.0,
+            model_used=route.selected_model,
+            complexity_score=route.complexity_score,
+            memory=state["memory"],
+        )
+
+    def _can_call_llm(self) -> bool:
+        return bool(settings.openai_api_key and ChatOpenAI is not None)

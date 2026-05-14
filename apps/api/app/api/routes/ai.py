@@ -32,7 +32,7 @@ from app.services.subscriptions import (
     FeatureName,
     PaywallError,
     assert_feature_access,
-    classify_prompt_feature_with_gemma,
+    classify_prompt_feature_for_billing,
     commit_usage,
     refund_usage,
     reset_active_billing_feature,
@@ -91,7 +91,7 @@ async def assistant_message(
     has_image_attachment = any(
         attachment.get("kind") == "image" for attachment in payload.attachments
     )
-    feature = await classify_prompt_feature_with_gemma(
+    feature = await classify_prompt_feature_for_billing(
         payload.prompt,
         has_image_attachment=has_image_attachment,
     )

@@ -1,6 +1,6 @@
 import asyncio
 
-from app.llm.memory import AgentMemoryHandler, MAX_REPLAY_HISTORY_MESSAGES, MAX_STORED_HISTORY_MESSAGES
+from app.services.assistant.conversation_memory import AgentMemoryHandler, MAX_REPLAY_HISTORY_MESSAGES, MAX_STORED_HISTORY_MESSAGES
 from app.schemas.assistant import ConversationState
 
 

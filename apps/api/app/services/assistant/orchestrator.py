@@ -55,6 +55,7 @@ from app.services.assistant.conversation_memory import AgentMemoryHandler
 from app.services.assistant.memory import PlanningMemoryService
 from app.services.assistant.state import ConversationStateStore
 from app.services.assistant.tools import AssistantToolRegistry
+from app.services.subscriptions import FeatureName, classify_prompt_feature
 
 try:  # pragma: no cover - exercised only when optional deps are installed
     from langgraph.graph import END, START, StateGraph
@@ -124,6 +125,24 @@ COMPLEX_TOOLS: tuple[str, ...] = tuple(TOOL_MODELS)
 
 YES_REPLIES = {"yes", "y", "ok", "okay", "sure", "confirm", "apply", "apply changes", "do it"}
 NO_REPLIES = {"no", "n", "cancel", "stop", "don't", "dont", "do not", "reject"}
+
+
+def _chat_model(model: str):
+    if ChatOpenAI is None:
+        return None
+    base_kwargs = {"model": model, "api_key": settings.openai_api_key}
+    try:
+        return ChatOpenAI(
+            **base_kwargs,
+            timeout=settings.assistant_model_timeout_seconds,
+            max_retries=1,
+        )
+    except TypeError as exc:
+        if "timeout" not in str(exc) and "max_retries" not in str(exc):
+            raise
+        return ChatOpenAI(**base_kwargs)
+
+
 class RouteDecision(BaseModel):
     intent: CalendarIntentName
     route: Literal["simple", "complex"]
@@ -246,6 +265,13 @@ def _is_yes(prompt: str) -> bool:
 def _is_no(prompt: str) -> bool:
     normalized = _prompt_norm(prompt).strip(".! ")
     return normalized in NO_REPLIES or normalized.startswith(("no ", "cancel "))
+
+
+def _should_skip_frontline_for_planning(prompt: str) -> bool:
+    return classify_prompt_feature(prompt) in {
+        FeatureName.WEEKLY_PLANNING,
+        FeatureName.MONTHLY_PLANNING,
+    }
 
 
 def _safe_zoneinfo(timezone: str):
@@ -805,6 +831,34 @@ class AssistantOrchestrator:
         state["selected_tools"] = FRONTLINE_TOOLS
         state["messages"] = self._build_messages(state)
         await state["memory_handler"].add_user_message(payload.prompt)
+        if _should_skip_frontline_for_planning(payload.prompt):
+            result = await self._delegate_to_smarter_model(
+                state,
+                DelegateToSmarterModelInput(
+                    task=payload.prompt,
+                    reason="The user asked for period planning, so route directly to the planner model.",
+                ),
+            )
+            state["delegated_to_smarter_model"] = True
+            state["answer"] = result.answer
+            state["planned_tool_calls"] = result.planned_tool_calls
+            state["tool_results"] = [
+                {
+                    "tool": DELEGATE_TOOL,
+                    "result": result,
+                    "success": result.success,
+                    **({"error": result.answer} if not result.success and result.answer else {}),
+                }
+            ]
+            state["route"] = RouteDecision(
+                intent=result.intent,
+                route="complex",
+                selected_model=result.selected_model,
+                confidence=0.9,
+                complexity_score=6.0,
+                reason="Period planning was routed directly to the planner model.",
+                candidate_tools=_public_tool_names(COMPLEX_TOOLS),
+            )
         return state
 
     async def _agent_node(self, state: AgentGraphState) -> AgentGraphState:
@@ -826,10 +880,9 @@ class AssistantOrchestrator:
         route = state["route"]
         tool_specs = _tool_specs(state["selected_tools"])
         try:  # pragma: no cover - requires optional packages and API key
-            llm = ChatOpenAI(
-                model=route.selected_model,
-                api_key=settings.openai_api_key,
-            )
+            llm = _chat_model(route.selected_model)
+            if llm is None:
+                raise RuntimeError("OpenAI chat model is not available.")
             message = await llm.bind_tools(tool_specs).ainvoke(state["messages"])
         except Exception as exc:
             logger.warning("assistant.llm_failed", exc_info=True)
@@ -1055,8 +1108,10 @@ class AssistantOrchestrator:
         tool_records: list[dict[str, Any]] = []
         answer = ""
         try:  # pragma: no cover - external model call is exercised with fakes in tests
-            llm = ChatOpenAI(model=settings.ai_complex_model, api_key=settings.openai_api_key)
-            for _ in range(4):
+            llm = _chat_model(settings.ai_complex_model)
+            if llm is None:
+                raise RuntimeError("OpenAI chat model is not available.")
+            for _ in range(max(1, settings.assistant_smart_model_iterations)):
                 message = await llm.bind_tools(tool_specs).ainvoke(messages)
                 messages.append(self._message_to_dict(message))
                 calls = [

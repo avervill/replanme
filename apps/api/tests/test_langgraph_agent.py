@@ -390,7 +390,7 @@ def test_complex_plan_returns_confirmation_without_mutation(monkeypatch):
     assert response.model_used == "gpt-5.4-mini"
     assert registry.created == []
     assert response.execution.preview
-    assert FakeChatOpenAI.model_calls == ["gpt-4o-mini", "gpt-5.4-mini"]
+    assert FakeChatOpenAI.model_calls == ["gpt-5.4-mini"]
 
 
 def test_natural_task_today_returns_draft_not_generic(monkeypatch):

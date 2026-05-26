@@ -66,6 +66,8 @@ class Settings(BaseSettings):
     assistant_pending_plan_ttl_seconds: int = 60 * 30
     assistant_conversation_ttl_seconds: int = 60 * 60 * 12
     assistant_retry_attempts: int = 3
+    assistant_model_timeout_seconds: float = 25.0
+    assistant_smart_model_iterations: int = 3
 
     # ----- Google OAuth -----
     google_client_id: str = ""

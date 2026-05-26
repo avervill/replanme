@@ -250,6 +250,38 @@ class AssistantToolRegistry:
         db: AsyncSession,
         memory: UserPlanningMemory,
     ) -> CreateEventResult:
+        preview = [
+            PlanPreviewChange(
+                action="create_event",
+                title=payload.title,
+                details="Create a new calendar event.",
+                proposed_start_at=payload.start_at,
+                proposed_end_at=payload.end_at,
+            )
+        ]
+        if payload.dry_run:
+            preview_event = CalendarEventSnapshot(
+                id="preview:create_event",
+                title=payload.title,
+                description=payload.description,
+                start_at=payload.start_at,
+                end_at=payload.end_at,
+                timezone=payload.timezone,
+                location=payload.location,
+                status="preview",
+                html_link=None,
+            )
+            return CreateEventResult(
+                success=True,
+                metadata=ToolExecutionMetadata(
+                    tool="create_event",
+                    executed=False,
+                    dry_run=True,
+                ),
+                created_events=[preview_event],
+                preview=preview,
+            )
+
         existing = await self.fetch_events(
             FetchEventsInput(start_at=payload.start_at, end_at=payload.end_at),
             user=user,
@@ -290,29 +322,6 @@ class AssistantToolRegistry:
                 proposed_end_at=payload.end_at,
             )
         ]
-        if payload.dry_run:
-            preview_event = CalendarEventSnapshot(
-                id="preview:create_event",
-                title=payload.title,
-                description=payload.description,
-                start_at=payload.start_at,
-                end_at=payload.end_at,
-                timezone=payload.timezone,
-                location=payload.location,
-                status="preview",
-                html_link=None,
-            )
-            return CreateEventResult(
-                success=True,
-                metadata=ToolExecutionMetadata(
-                    tool="create_event",
-                    executed=False,
-                    dry_run=True,
-                ),
-                created_events=[preview_event],
-                preview=preview,
-            )
-
         body = _snapshot_to_google_body(payload)
         body["reminders"] = {
             "useDefault": False,

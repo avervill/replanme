@@ -28,6 +28,7 @@ type ChatMessage = {
 };
 
 const SESSION_STORAGE_KEY = "replanme_assistant_session";
+const CHAT_HISTORY_TIMEOUT_MS = 3500;
 
 const starterMessage: ChatMessage = {
   id: 1,
@@ -61,11 +62,12 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
   const [input, setInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [sessionId, setSessionId] = useState("");
-  const [loadingHistory, setLoadingHistory] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const { refresh } = useAuth();
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const consumedInitialPromptRef = useRef<string | null>(null);
+  const hasLocalActivityRef = useRef(false);
   const promptTools = useAiPromptTools({
     onTranscript: (text) => setInput((current) => (current.trim() ? `${current.trim()} ${text}` : text)),
     onPaywall,
@@ -82,9 +84,17 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
     }
     setSessionId(nextId);
 
+    let cancelled = false;
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      if (!cancelled) setLoadingHistory(false);
+    }, CHAT_HISTORY_TIMEOUT_MS);
+
     setLoadingHistory(true);
     fetchChatHistory(nextId)
       .then((data) => {
+        if (cancelled || timedOut || hasLocalActivityRef.current) return;
         if (data.messages && data.messages.length > 0) {
           const historyMessages: ChatMessage[] = data.messages.map((m, index) => ({
             id: index + 1000, // offset IDs to avoid conflict with starter message
@@ -98,8 +108,14 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
         console.error("Failed to load chat history:", err);
       })
       .finally(() => {
-        setLoadingHistory(false);
+        window.clearTimeout(timeoutId);
+        if (!cancelled) setLoadingHistory(false);
       });
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
   }, []);
 
   useEffect(() => {
@@ -127,6 +143,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
     const pendingMessageId = Date.now() + 1;
     const pendingText = getPendingText(prompt);
 
+    hasLocalActivityRef.current = true;
     setMessages((current) => [
       ...current,
       userMessage,
@@ -227,6 +244,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
   const handleConfirmation = async (messageId: number) => {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     const confirmationToken = messages.find((msg) => msg.id === messageId)?.confirmationToken ?? null;
+    hasLocalActivityRef.current = true;
     setMessages((current) =>
       current.map((msg) =>
         msg.id === messageId
@@ -310,6 +328,7 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
               if (!sessionId) return;
               try {
                 await clearChatHistory(sessionId);
+                hasLocalActivityRef.current = true;
                 setMessages([starterMessage]);
               } catch (e) {
                 console.error("Failed to clear chat", e);
@@ -330,11 +349,11 @@ export function AiChatPanel({ timeframe, onCollapse, onCalendarChanged, onPaywal
 
       <div ref={viewportRef} className="dashboard-chat-messages">
         {loadingHistory && (
-          <div className="flex justify-center p-6 w-full">
-            <span className="h-6 w-6 animate-spin rounded-full border-2 border-[var(--primary)] border-t-transparent opacity-50 block mx-auto"></span>
+          <div className="flex w-full items-center justify-center px-4 py-2 text-xs font-semibold text-calm-muted">
+            Loading chat history...
           </div>
         )}
-        {!loadingHistory && messages.map((message) => (
+        {messages.map((message) => (
           <div
             key={message.id}
             className={`flex flex-col ${message.role === "assistant" ? "items-start pr-10" : "items-end pl-10"

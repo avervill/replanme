@@ -23,7 +23,6 @@ export function DashboardShell() {
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [paywall, setPaywall] = useState<PaywallPayload | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [reopenOnboarding, setReopenOnboarding] = useState(false);
   const onboarding = useOnboarding(Boolean(user));
 
   useEffect(() => {
@@ -101,21 +100,17 @@ export function DashboardShell() {
       {settingsOpen && (
         <AccountSettingsModal
           user={user}
+          onboardingStatus={onboarding.status}
           onClose={() => setSettingsOpen(false)}
-          onOpenOnboarding={() => {
-            setSettingsOpen(false);
-            setReopenOnboarding(true);
-          }}
+          onPreferencesSaved={() => void onboarding.refresh()}
         />
       )}
       <PaywallModal paywall={paywall} onClose={() => setPaywall(null)} />
-      {(onboarding.shouldShowOnboarding || reopenOnboarding) && (
+      {onboarding.shouldShowOnboarding && (
         <OnboardingFlow
           user={user}
-          mode={reopenOnboarding ? "settings" : "first-run"}
-          onClose={reopenOnboarding ? () => setReopenOnboarding(false) : undefined}
+          mode="first-run"
           onFinished={() => {
-            setReopenOnboarding(false);
             void onboarding.refresh();
           }}
         />

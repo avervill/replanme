@@ -527,7 +527,10 @@ def _compact_onboarding_profile(data: Any) -> str:
         return str(value) if value else ""
 
     energy = data.get("energyProfile") if isinstance(data.get("energyProfile"), dict) else {}
-    lines = ["Onboarding profile:"]
+    lines = [
+        "User planning preferences:",
+        "Use these as persistent defaults unless the current request overrides them.",
+    ]
     fields = [
         ("role", data.get("role")),
         ("main goal", data.get("mainGoal")),

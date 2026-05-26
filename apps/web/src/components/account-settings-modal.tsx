@@ -1,57 +1,119 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { fetchSubscriptionUsage, type SubscriptionUsageResponse } from "@/lib/api";
-import type { UserProfile } from "@/lib/api";
+import { useState } from "react";
+import {
+  saveOnboarding,
+  type OnboardingData,
+  type OnboardingStatus,
+  type UserProfile,
+} from "@/lib/api";
 
 type AccountSettingsModalProps = {
   user: UserProfile;
+  onboardingStatus: OnboardingStatus | null;
   onClose: () => void;
-  onOpenOnboarding?: () => void;
+  onPreferencesSaved?: (status: OnboardingStatus) => void;
 };
 
-const usageRows: Array<[keyof SubscriptionUsageResponse["usage"], string]> = [
-  ["aiActions", "AI actions"],
-  ["weeklyPlans", "Weekly plans"],
-  ["imageImports", "Image imports"],
-  ["voiceInputs", "Voice inputs"],
-  ["monthlyPlans", "Monthly planning"],
-  ["smartReschedules", "Smart rescheduling"],
-  ["energySchedules", "Energy scheduling"],
-  ["recurringPlans", "Recurring AI planning"],
-];
+type EnergyProfile = OnboardingData["energyProfile"];
 
-function formatMetric(metric: { used: number; limit: number | null; allowed: boolean }): string {
-  if (!metric.allowed) return "Pro only";
-  if (metric.limit === null) return "Unlimited";
-  return `${metric.used} / ${metric.limit} used this month`;
+const emptyEnergy: EnergyProfile = {
+  peakFocusTime: [],
+  lowEnergyTime: [],
+  preferredWorkBlockLength: [],
+  sleepPreference: [],
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-export function AccountSettingsModal({ user, onClose, onOpenOnboarding }: AccountSettingsModalProps) {
-  const [usage, setUsage] = useState<SubscriptionUsageResponse | null>(null);
+function fieldText(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean).map(String).join("\n");
+  }
+  return typeof value === "string" ? value : "";
+}
+
+function listFromText(value: string): string[] {
+  return value
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function initialPreferences(status: OnboardingStatus | null, user: UserProfile) {
+  const data = isRecord(status?.onboardingData) ? status.onboardingData : {};
+  const energy = isRecord(data.energyProfile) ? data.energyProfile : emptyEnergy;
+
+  return {
+    role: fieldText(data.role) || "Just planning life",
+    mainGoal: fieldText(data.mainGoal),
+    planningPain: fieldText(data.planningPain),
+    peakFocusTime: fieldText(energy.peakFocusTime),
+    lowEnergyTime: fieldText(energy.lowEnergyTime),
+    preferredWorkBlockLength: fieldText(energy.preferredWorkBlockLength),
+    sleepPreference: fieldText(energy.sleepPreference),
+    calendarIntent: fieldText(data.calendarIntent) || (user.has_google_calendar ? "Use my calendar to avoid conflicts" : "Let me generate drafts first"),
+    firstPrompt: fieldText(data.firstPrompt) || "Plan my week around my goals, calendar, energy, and realistic focus blocks.",
+  };
+}
+
+export function AccountSettingsModal({ user, onboardingStatus, onClose, onPreferencesSaved }: AccountSettingsModalProps) {
+  const initial = initialPreferences(onboardingStatus, user);
+  const [role, setRole] = useState(initial.role);
+  const [mainGoal, setMainGoal] = useState(initial.mainGoal);
+  const [planningPain, setPlanningPain] = useState(initial.planningPain);
+  const [peakFocusTime, setPeakFocusTime] = useState(initial.peakFocusTime);
+  const [lowEnergyTime, setLowEnergyTime] = useState(initial.lowEnergyTime);
+  const [preferredWorkBlockLength, setPreferredWorkBlockLength] = useState(initial.preferredWorkBlockLength);
+  const [sleepPreference, setSleepPreference] = useState(initial.sleepPreference);
+  const [calendarIntent, setCalendarIntent] = useState(initial.calendarIntent);
+  const [firstPrompt, setFirstPrompt] = useState(initial.firstPrompt);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let mounted = true;
-    fetchSubscriptionUsage()
-      .then((data) => {
-        if (mounted) setUsage(data);
-      })
-      .catch((err: unknown) => {
-        if (mounted) setError(err instanceof Error ? err.message : "Could not load usage.");
-      });
-    return () => {
-      mounted = false;
+  const canSave = Boolean(role.trim() && calendarIntent.trim() && firstPrompt.trim());
+
+  const submit = async () => {
+    if (!canSave || saving) return;
+    setSaving(true);
+    setSaved(false);
+    setError(null);
+
+    const data: OnboardingData = {
+      role: role.trim(),
+      mainGoal: listFromText(mainGoal),
+      planningPain: listFromText(planningPain),
+      energyProfile: {
+        peakFocusTime: listFromText(peakFocusTime),
+        lowEnergyTime: listFromText(lowEnergyTime),
+        preferredWorkBlockLength: listFromText(preferredWorkBlockLength),
+        sleepPreference: listFromText(sleepPreference),
+      },
+      calendarIntent: calendarIntent.trim(),
+      firstPrompt: firstPrompt.trim(),
     };
-  }, []);
+
+    try {
+      const status = await saveOnboarding(data);
+      onPreferencesSaved?.(status);
+      setSaved(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save preferences.");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div className="dashboard-modal-backdrop fixed inset-0 z-[150] flex items-center justify-center px-4 py-6">
-      <div className="dashboard-modal w-full max-w-2xl rounded-[1.5rem] p-6 shadow-xl">
+      <div className="dashboard-modal max-h-[88vh] w-full max-w-3xl overflow-y-auto rounded-[1.5rem] p-6 shadow-xl">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="eyebrow">Account</p>
-            <h2 className="mt-3 text-2xl font-semibold text-calm-text">Plan and usage</h2>
+            <h2 className="mt-3 text-2xl font-semibold text-calm-text">Planning preferences</h2>
             <p className="mt-2 text-sm text-calm-muted">{user.email}</p>
           </div>
           <button
@@ -63,50 +125,120 @@ export function AccountSettingsModal({ user, onClose, onOpenOnboarding }: Accoun
           </button>
         </div>
 
-        <div className="mt-6 rounded-2xl border border-[rgba(124,58,237,0.16)] bg-white/60 px-4 py-3">
-          <p className="text-sm font-semibold text-calm-text">
-            Plan: {(usage?.plan ?? user.plan).toUpperCase()}
-          </p>
-          <p className="mt-1 text-sm text-calm-muted">
-            Status: {usage?.subscriptionStatus ?? user.subscription_status}
-          </p>
-          <p className="mt-1 text-sm font-semibold text-calm-text">
-            Planning credits: {usage?.planningCredits ?? user.planning_credits}
-          </p>
-        </div>
-
-        {onOpenOnboarding && (
-          <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-[rgba(20,184,166,0.18)] bg-[rgba(20,184,166,0.08)] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="text-sm font-semibold text-calm-text">Planning setup</p>
-              <p className="mt-1 text-sm text-calm-muted">Revisit your role, planning pain, energy profile, and first-plan prompt.</p>
-            </div>
-            <button
-              type="button"
-              onClick={onOpenOnboarding}
-              className="rounded-xl border border-[rgba(20,184,166,0.24)] bg-white/70 px-4 py-2 text-sm font-semibold text-calm-text transition hover:bg-white"
-            >
-              Reopen onboarding
-            </button>
-          </div>
-        )}
-
         {error ? (
-          <p className="mt-5 rounded-2xl border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-700">
+          <p className="mt-5 rounded-xl border border-red-500/20 bg-red-500/5 px-4 py-3 text-sm text-red-700">
             {error}
           </p>
-        ) : !usage ? (
-          <p className="mt-6 text-sm text-calm-muted">Loading usage...</p>
-        ) : (
-          <div className="mt-6 grid gap-3 sm:grid-cols-2">
-            {usageRows.map(([key, label]) => (
-              <div key={key} className="rounded-2xl border border-[rgba(124,58,237,0.12)] bg-white/50 px-4 py-3">
-                <p className="text-sm font-semibold text-calm-text">{label}</p>
-                <p className="mt-1 text-sm text-calm-muted">{formatMetric(usage.usage[key])}</p>
-              </div>
-            ))}
-          </div>
-        )}
+        ) : null}
+        {saved ? (
+          <p className="mt-5 rounded-xl border border-[rgba(20,184,166,0.22)] bg-[rgba(20,184,166,0.08)] px-4 py-3 text-sm font-semibold text-[var(--teal-deep)]">
+            Preferences saved.
+          </p>
+        ) : null}
+
+        <div className="mt-6 grid gap-5 sm:grid-cols-2">
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Role</span>
+            <input
+              value={role}
+              onChange={(event) => setRole(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Calendar intent</span>
+            <input
+              value={calendarIntent}
+              onChange={(event) => setCalendarIntent(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Main goals</span>
+            <textarea
+              value={mainGoal}
+              onChange={(event) => setMainGoal(event.target.value)}
+              rows={4}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Planning pain</span>
+            <textarea
+              value={planningPain}
+              onChange={(event) => setPlanningPain(event.target.value)}
+              rows={4}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Peak focus time</span>
+            <textarea
+              value={peakFocusTime}
+              onChange={(event) => setPeakFocusTime(event.target.value)}
+              rows={3}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Low energy time</span>
+            <textarea
+              value={lowEnergyTime}
+              onChange={(event) => setLowEnergyTime(event.target.value)}
+              rows={3}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Work block length</span>
+            <textarea
+              value={preferredWorkBlockLength}
+              onChange={(event) => setPreferredWorkBlockLength(event.target.value)}
+              rows={3}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Sleep preference</span>
+            <textarea
+              value={sleepPreference}
+              onChange={(event) => setSleepPreference(event.target.value)}
+              rows={3}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+
+          <label className="block sm:col-span-2">
+            <span className="text-sm font-extrabold text-[var(--ink)]">Default planning brief</span>
+            <textarea
+              value={firstPrompt}
+              onChange={(event) => setFirstPrompt(event.target.value)}
+              rows={5}
+              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
+            />
+          </label>
+        </div>
+
+        <div className="mt-6 flex flex-col gap-3 border-t border-[rgba(124,58,237,0.12)] pt-5 sm:flex-row sm:justify-end">
+          <button type="button" onClick={onClose} className="secondary-button min-h-11 px-5">
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => void submit()}
+            disabled={!canSave || saving}
+            className="primary-button min-h-11 px-5 disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {saving ? "Saving..." : "Save preferences"}
+          </button>
+        </div>
       </div>
     </div>
   );

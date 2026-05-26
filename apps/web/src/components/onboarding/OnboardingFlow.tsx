@@ -6,28 +6,19 @@ import { storePendingInitialPrompt, useOnboarding } from "@/hooks/useOnboarding"
 import { useAiPromptTools } from "@/hooks/useAiPromptTools";
 import { AiPromptTools } from "@/components/ai-prompt-tools";
 import { OnboardingStep } from "@/components/onboarding/OnboardingStep";
+import {
+  MultiOptionGrid,
+  OptionGrid,
+  blockLengthOptions,
+  goalOptions,
+  lowEnergyOptions,
+  painOptions,
+  peakFocusOptions,
+  roleOptions,
+  sleepOptions,
+  type MultiValue,
+} from "@/components/onboarding/preference-options";
 
-const roleOptions = ["Student", "Manager", "Founder", "Freelancer", "Developer", "Just planning life"];
-const goalOptions = [
-  "Study / exam planning",
-  "Work tasks and meetings",
-  "Personal routines",
-  "Fitness and habits",
-  "Weekly life organization",
-  "Overloaded calendar optimization",
-];
-const painOptions = [
-  "I don't know where to start",
-  "I overpack my schedule",
-  "I procrastinate",
-  "My energy changes during the day",
-  "My calendar is messy",
-  "Plans change too often",
-];
-const peakFocusOptions = ["Morning", "Afternoon", "Evening", "Late night", "It depends"];
-const lowEnergyOptions = ["Morning", "Afternoon", "Evening", "Late night", "It depends"];
-const blockLengthOptions = ["25 minutes", "45 minutes", "60 minutes", "90 minutes", "2 hours"];
-const sleepOptions = ["I need 7+ hours of sleep", "I need 8+ hours of sleep", "I work late", "I wake up early", "No strict preference"];
 type OnboardingFlowProps = {
   user: UserProfile;
   onFinished: (firstPrompt?: string) => void;
@@ -36,7 +27,6 @@ type OnboardingFlowProps = {
 };
 
 type EnergyProfile = OnboardingData["energyProfile"];
-type MultiValue = string[];
 
 const defaultEnergy: EnergyProfile = {
   peakFocusTime: [],
@@ -80,59 +70,6 @@ function generatePrompt(role: string, mainGoal: MultiValue, planningPain: MultiV
     return `Optimize my overloaded calendar this week. Protect deep work during ${focus}, move flexible work away from ${low}, preserve recovery time, and make the plan realistic. ${calendar}`;
   }
   return `Plan my week around my main goals, routines, and calendar. Use ${block} work blocks, put important work during ${focus}, avoid ${low}, account for "${pain}", and respect ${sleep}. ${calendar}`;
-}
-
-function OptionGrid({ options, value, onChange }: { options: string[]; value: string; onChange: (value: string) => void }) {
-  return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      {options.map((option) => {
-        const selected = value === option;
-        return (
-          <button
-            key={option}
-            type="button"
-            onClick={() => onChange(option)}
-            className={`rounded-2xl border px-4 py-4 text-left text-sm font-extrabold transition ${
-              selected
-                ? "border-[rgba(20,184,166,0.52)] bg-[rgba(20,184,166,0.13)] text-[var(--teal-deep)] shadow-[0_14px_28px_rgba(20,184,166,0.14)]"
-                : "border-[rgba(124,58,237,0.14)] bg-white/58 text-[rgba(35,25,66,0.78)] hover:border-[rgba(124,58,237,0.28)] hover:bg-white/78"
-            }`}
-          >
-            {option}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function MultiOptionGrid({ options, value, onChange }: { options: string[]; value: MultiValue; onChange: (value: MultiValue) => void }) {
-  const toggle = (option: string) => {
-    onChange(value.includes(option) ? value.filter((item) => item !== option) : [...value, option]);
-  };
-
-  return (
-    <div className="grid gap-3 sm:grid-cols-2">
-      {options.map((option) => {
-        const selected = value.includes(option);
-        return (
-          <button
-            key={option}
-            type="button"
-            onClick={() => toggle(option)}
-            aria-pressed={selected}
-            className={`rounded-2xl border px-4 py-4 text-left text-sm font-extrabold transition ${
-              selected
-                ? "border-[rgba(20,184,166,0.52)] bg-[rgba(20,184,166,0.13)] text-[var(--teal-deep)] shadow-[0_14px_28px_rgba(20,184,166,0.14)]"
-                : "border-[rgba(124,58,237,0.14)] bg-white/58 text-[rgba(35,25,66,0.78)] hover:border-[rgba(124,58,237,0.28)] hover:bg-white/78"
-            }`}
-          >
-            {option}
-          </button>
-        );
-      })}
-    </div>
-  );
 }
 
 export function OnboardingFlow({ user, onFinished, onClose, mode = "first-run" }: OnboardingFlowProps) {

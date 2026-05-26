@@ -7,6 +7,18 @@ import {
   type OnboardingStatus,
   type UserProfile,
 } from "@/lib/api";
+import {
+  MultiOptionGrid,
+  OptionGrid,
+  blockLengthOptions,
+  goalOptions,
+  lowEnergyOptions,
+  painOptions,
+  peakFocusOptions,
+  roleOptions,
+  sleepOptions,
+  type MultiValue,
+} from "@/components/onboarding/preference-options";
 
 type AccountSettingsModalProps = {
   user: UserProfile;
@@ -15,9 +27,14 @@ type AccountSettingsModalProps = {
   onPreferencesSaved?: (status: OnboardingStatus) => void;
 };
 
-type EnergyProfile = OnboardingData["energyProfile"];
+type SettingsEnergyProfile = {
+  peakFocusTime: MultiValue;
+  lowEnergyTime: MultiValue;
+  preferredWorkBlockLength: MultiValue;
+  sleepPreference: MultiValue;
+};
 
-const emptyEnergy: EnergyProfile = {
+const emptyEnergy: SettingsEnergyProfile = {
   peakFocusTime: [],
   lowEnergyTime: [],
   preferredWorkBlockLength: [],
@@ -28,18 +45,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function fieldText(value: unknown): string {
+function textFromValue(value: unknown): string {
   if (Array.isArray(value)) {
-    return value.filter(Boolean).map(String).join("\n");
+    return value.filter(Boolean).map(String).join(", ");
   }
   return typeof value === "string" ? value : "";
 }
 
-function listFromText(value: string): string[] {
-  return value
-    .split("\n")
-    .map((item) => item.trim())
-    .filter(Boolean);
+function listFromValue(value: unknown): MultiValue {
+  if (Array.isArray(value)) {
+    return value.filter(Boolean).map(String);
+  }
+  if (typeof value === "string" && value.trim()) {
+    return [value.trim()];
+  }
+  return [];
 }
 
 function initialPreferences(status: OnboardingStatus | null, user: UserProfile) {
@@ -47,34 +67,45 @@ function initialPreferences(status: OnboardingStatus | null, user: UserProfile) 
   const energy = isRecord(data.energyProfile) ? data.energyProfile : emptyEnergy;
 
   return {
-    role: fieldText(data.role) || "Just planning life",
-    mainGoal: fieldText(data.mainGoal),
-    planningPain: fieldText(data.planningPain),
-    peakFocusTime: fieldText(energy.peakFocusTime),
-    lowEnergyTime: fieldText(energy.lowEnergyTime),
-    preferredWorkBlockLength: fieldText(energy.preferredWorkBlockLength),
-    sleepPreference: fieldText(energy.sleepPreference),
-    calendarIntent: fieldText(data.calendarIntent) || (user.has_google_calendar ? "Use my calendar to avoid conflicts" : "Let me generate drafts first"),
-    firstPrompt: fieldText(data.firstPrompt) || "Plan my week around my goals, calendar, energy, and realistic focus blocks.",
+    role: textFromValue(data.role) || "Just planning life",
+    mainGoal: listFromValue(data.mainGoal),
+    planningPain: listFromValue(data.planningPain),
+    energyProfile: {
+      peakFocusTime: listFromValue(energy.peakFocusTime),
+      lowEnergyTime: listFromValue(energy.lowEnergyTime),
+      preferredWorkBlockLength: listFromValue(energy.preferredWorkBlockLength),
+      sleepPreference: listFromValue(energy.sleepPreference),
+    },
+    calendarIntent: textFromValue(data.calendarIntent) || (user.has_google_calendar ? "Use my calendar to avoid conflicts" : "Let me generate drafts first"),
+    firstPrompt: textFromValue(data.firstPrompt) || "Plan my week around my goals, calendar, energy, and realistic focus blocks.",
   };
+}
+
+function PreferenceSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h3 className="mb-3 text-sm font-extrabold text-[var(--ink)]">{title}</h3>
+      {children}
+    </section>
+  );
 }
 
 export function AccountSettingsModal({ user, onboardingStatus, onClose, onPreferencesSaved }: AccountSettingsModalProps) {
   const initial = initialPreferences(onboardingStatus, user);
   const [role, setRole] = useState(initial.role);
-  const [mainGoal, setMainGoal] = useState(initial.mainGoal);
-  const [planningPain, setPlanningPain] = useState(initial.planningPain);
-  const [peakFocusTime, setPeakFocusTime] = useState(initial.peakFocusTime);
-  const [lowEnergyTime, setLowEnergyTime] = useState(initial.lowEnergyTime);
-  const [preferredWorkBlockLength, setPreferredWorkBlockLength] = useState(initial.preferredWorkBlockLength);
-  const [sleepPreference, setSleepPreference] = useState(initial.sleepPreference);
-  const [calendarIntent, setCalendarIntent] = useState(initial.calendarIntent);
-  const [firstPrompt, setFirstPrompt] = useState(initial.firstPrompt);
+  const [mainGoal, setMainGoal] = useState<MultiValue>(initial.mainGoal);
+  const [planningPain, setPlanningPain] = useState<MultiValue>(initial.planningPain);
+  const [energyProfile, setEnergyProfile] = useState<SettingsEnergyProfile>(initial.energyProfile);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canSave = Boolean(role.trim() && calendarIntent.trim() && firstPrompt.trim());
+  const canSave = Boolean(
+    role.trim() &&
+      mainGoal.length > 0 &&
+      planningPain.length > 0 &&
+      Object.values(energyProfile).every((value) => value.length > 0),
+  );
 
   const submit = async () => {
     if (!canSave || saving) return;
@@ -84,16 +115,11 @@ export function AccountSettingsModal({ user, onboardingStatus, onClose, onPrefer
 
     const data: OnboardingData = {
       role: role.trim(),
-      mainGoal: listFromText(mainGoal),
-      planningPain: listFromText(planningPain),
-      energyProfile: {
-        peakFocusTime: listFromText(peakFocusTime),
-        lowEnergyTime: listFromText(lowEnergyTime),
-        preferredWorkBlockLength: listFromText(preferredWorkBlockLength),
-        sleepPreference: listFromText(sleepPreference),
-      },
-      calendarIntent: calendarIntent.trim(),
-      firstPrompt: firstPrompt.trim(),
+      mainGoal,
+      planningPain,
+      energyProfile,
+      calendarIntent: initial.calendarIntent,
+      firstPrompt: initial.firstPrompt,
     };
 
     try {
@@ -136,94 +162,52 @@ export function AccountSettingsModal({ user, onboardingStatus, onClose, onPrefer
           </p>
         ) : null}
 
-        <div className="mt-6 grid gap-5 sm:grid-cols-2">
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Role</span>
-            <input
-              value={role}
-              onChange={(event) => setRole(event.target.value)}
-              className="mt-2 w-full rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+        <div className="mt-6 space-y-6">
+          <PreferenceSection title="Role">
+            <OptionGrid options={roleOptions} value={role} onChange={setRole} />
+          </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Calendar intent</span>
-            <input
-              value={calendarIntent}
-              onChange={(event) => setCalendarIntent(event.target.value)}
-              className="mt-2 w-full rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+          <PreferenceSection title="Main goals">
+            <MultiOptionGrid options={goalOptions} value={mainGoal} onChange={setMainGoal} />
+          </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Main goals</span>
-            <textarea
-              value={mainGoal}
-              onChange={(event) => setMainGoal(event.target.value)}
-              rows={4}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+          <PreferenceSection title="Planning pain">
+            <MultiOptionGrid options={painOptions} value={planningPain} onChange={setPlanningPain} />
+          </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Planning pain</span>
-            <textarea
-              value={planningPain}
-              onChange={(event) => setPlanningPain(event.target.value)}
-              rows={4}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+          <div className="grid gap-5 lg:grid-cols-2">
+            <PreferenceSection title="Peak focus time">
+              <MultiOptionGrid
+                options={peakFocusOptions}
+                value={energyProfile.peakFocusTime}
+                onChange={(value) => setEnergyProfile((current) => ({ ...current, peakFocusTime: value }))}
+              />
+            </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Peak focus time</span>
-            <textarea
-              value={peakFocusTime}
-              onChange={(event) => setPeakFocusTime(event.target.value)}
-              rows={3}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+            <PreferenceSection title="Low energy time">
+              <MultiOptionGrid
+                options={lowEnergyOptions}
+                value={energyProfile.lowEnergyTime}
+                onChange={(value) => setEnergyProfile((current) => ({ ...current, lowEnergyTime: value }))}
+              />
+            </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Low energy time</span>
-            <textarea
-              value={lowEnergyTime}
-              onChange={(event) => setLowEnergyTime(event.target.value)}
-              rows={3}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+            <PreferenceSection title="Work block length">
+              <MultiOptionGrid
+                options={blockLengthOptions}
+                value={energyProfile.preferredWorkBlockLength}
+                onChange={(value) => setEnergyProfile((current) => ({ ...current, preferredWorkBlockLength: value }))}
+              />
+            </PreferenceSection>
 
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Work block length</span>
-            <textarea
-              value={preferredWorkBlockLength}
-              onChange={(event) => setPreferredWorkBlockLength(event.target.value)}
-              rows={3}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
-
-          <label className="block">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Sleep preference</span>
-            <textarea
-              value={sleepPreference}
-              onChange={(event) => setSleepPreference(event.target.value)}
-              rows={3}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
-
-          <label className="block sm:col-span-2">
-            <span className="text-sm font-extrabold text-[var(--ink)]">Default planning brief</span>
-            <textarea
-              value={firstPrompt}
-              onChange={(event) => setFirstPrompt(event.target.value)}
-              rows={5}
-              className="mt-2 w-full resize-none rounded-xl border border-[rgba(124,58,237,0.16)] bg-white/70 px-4 py-3 text-sm font-bold leading-6 text-[var(--ink)] outline-none transition focus:border-[rgba(20,184,166,0.42)]"
-            />
-          </label>
+            <PreferenceSection title="Sleep preference">
+              <MultiOptionGrid
+                options={sleepOptions}
+                value={energyProfile.sleepPreference}
+                onChange={(value) => setEnergyProfile((current) => ({ ...current, sleepPreference: value }))}
+              />
+            </PreferenceSection>
+          </div>
         </div>
 
         <div className="mt-6 flex flex-col gap-3 border-t border-[rgba(124,58,237,0.12)] pt-5 sm:flex-row sm:justify-end">

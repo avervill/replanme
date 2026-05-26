@@ -67,6 +67,8 @@ NEXT_PUBLIC_API_BASE_URL=https://<your-api-domain>/api/v1
 
 `NEXT_PUBLIC_API_BASE_URL` is used by the browser bundle, so redeploy the Web service after changing it.
 
+Do not use `http://localhost:8000/api/v1` on the Railway Web service. In a production browser, `localhost` means the visitor's own computer, not your Railway API. Chrome may show a permission prompt for access to local apps/services if the deployed frontend tries to call localhost.
+
 ## Google OAuth
 
 In Google Cloud Console, add this authorized redirect URI:

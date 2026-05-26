@@ -2,9 +2,33 @@
  * Typed API client with auth headers and error handling.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000/api/v1";
 export const AUTH_TOKEN_STORAGE_KEY = "replanme_token";
 const LEGACY_AUTH_TOKEN_STORAGE_KEYS = ["resched_me_token", "reschedai_token"];
+
+function isLocalApiUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isLocalBrowserHost(): boolean {
+  if (typeof window === "undefined") return true;
+  return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
+function apiBase(): string {
+  if (!isLocalBrowserHost() && isLocalApiUrl(CONFIGURED_API_BASE)) {
+    throw new ApiError(
+      500,
+      "Production API URL is misconfigured. Set NEXT_PUBLIC_API_BASE_URL to your Railway API domain, not localhost.",
+    );
+  }
+  return CONFIGURED_API_BASE;
+}
 
 export function readAuthToken(): string | null {
   if (typeof window === "undefined") return null;
@@ -115,7 +139,7 @@ async function handleResponse<T>(res: Response): Promise<T> {
 
 /** GET request with auth */
 export async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${apiBase()}${path}`, {
     cache: "no-store",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
   });
@@ -124,7 +148,7 @@ export async function apiGet<T>(path: string): Promise<T> {
 
 /** POST request with auth */
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${apiBase()}${path}`, {
     method: "POST",
     cache: "no-store",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -135,7 +159,7 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
 
 /** PUT request with auth */
 export async function apiPut<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${apiBase()}${path}`, {
     method: "PUT",
     cache: "no-store",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -146,7 +170,7 @@ export async function apiPut<T>(path: string, body: unknown): Promise<T> {
 
 /** DELETE request with auth */
 export async function apiDelete(path: string): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${apiBase()}${path}`, {
     method: "DELETE",
     cache: "no-store",
     headers: { ...authHeaders() },
@@ -461,7 +485,7 @@ export async function uploadAssistantFile(
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", `${API_BASE}/uploads`);
+    xhr.open("POST", `${apiBase()}/uploads`);
     const token = readAuthToken();
     if (token) {
       xhr.setRequestHeader("Authorization", `Bearer ${token}`);
@@ -497,7 +521,7 @@ export async function transcribeVoice(
 ): Promise<{ transcript: string }> {
   const form = new FormData();
   form.append("file", file, filename);
-  const res = await fetch(`${API_BASE}/uploads/voice/transcribe`, {
+  const res = await fetch(`${apiBase()}/uploads/voice/transcribe`, {
     method: "POST",
     cache: "no-store",
     headers: { ...authHeaders() },

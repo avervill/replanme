@@ -63,18 +63,3 @@ You can also run the whole stack with:
 ```powershell
 docker compose up --build
 ```
-
-## Railway deployment
-
-The project is prepared for Railway as two services from this monorepo:
-
-- API service: `apps/api`
-- Web service: `apps/web`
-
-See [docs/railway-deploy.md](docs/railway-deploy.md) for root directory settings, required variables, healthchecks, and deployment order.
-
-## Notes
-
-- The backend defaults to SQLite if `DATABASE_URL` is not set, but the intended production setup is Postgres.
-- Google OAuth, Google Calendar writes, Google AI calls, voice transcription, and OCR ingestion are controlled integration points that need production keys for full functionality.
-- The frontend presents the landing page, connected dashboard, schedule workspace, and AI assistant shell so you can continue feature implementation immediately.

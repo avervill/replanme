@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +24,10 @@ class Settings(BaseSettings):
     debug: bool = False
 
     database_url: str = "sqlite+aiosqlite:///./replanme.db"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        validation_alias=AliasChoices("REDIS_URL", "KV_URL", "UPSTASH_REDIS_URL"),
+    )
 
     frontend_url: str = "http://localhost:3000"
     session_cookie_name: str = "replanme_session"
@@ -51,6 +55,7 @@ class Settings(BaseSettings):
         env_file=discover_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator("database_url", mode="before")
@@ -59,10 +64,29 @@ class Settings(BaseSettings):
         if not isinstance(value, str):
             return value
         if value.startswith("postgres://"):
-            return value.replace("postgres://", "postgresql+asyncpg://", 1)
-        if value.startswith("postgresql://") and "+asyncpg" not in value:
-            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return value
+            value = value.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif value.startswith("postgresql://") and "+asyncpg" not in value:
+            value = value.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        if not value.startswith("postgresql+asyncpg://"):
+            return value
+
+        parsed = urlsplit(value)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        normalized_query: list[tuple[str, str]] = []
+        has_ssl = any(key == "ssl" for key, _ in query_items)
+        for key, query_value in query_items:
+            if key == "channel_binding":
+                continue
+            if key == "sslmode":
+                if not has_ssl:
+                    normalized_query.append(("ssl", query_value))
+                continue
+            normalized_query.append((key, query_value))
+
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(normalized_query), parsed.fragment)
+        )
 
     @field_validator("token_encryption_key")
     @classmethod

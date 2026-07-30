@@ -1,24 +1,23 @@
-import uuid
-from datetime import time
+from __future__ import annotations
 
-from sqlalchemy import ForeignKey, String, Time, Uuid
+import uuid
+
+from sqlalchemy import JSON, ForeignKey, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
 
 
-class EnergyProfile(TimestampMixin, Base):
-    __tablename__ = "energy_profiles"
+class PlanningProfile(TimestampMixin, Base):
+    __tablename__ = "planning_profiles"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        index=True,
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
     )
-    peak_start: Mapped[time] = mapped_column(Time)
-    peak_end: Mapped[time] = mapped_column(Time)
-    slump_start: Mapped[time] = mapped_column(Time)
-    slump_end: Mapped[time] = mapped_column(Time)
-    chronotype: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC", server_default="UTC")
+    energy_windows: Mapped[list] = mapped_column(JSON, default=list)
+    preferences: Mapped[dict] = mapped_column(JSON, default=dict)
 
+
+EnergyProfile = PlanningProfile

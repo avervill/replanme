@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -13,7 +13,6 @@ from app.core.security import get_current_user
 from app.models.user import User
 from app.schemas.calendar import (
     CalendarEventCreate,
-    CalendarEventResponse,
     CalendarEventUpdate,
     GoogleCalendarEvent,
 )
@@ -21,10 +20,9 @@ from app.services.google_calendar import (
     create_google_event,
     delete_google_event,
     get_google_event,
-    list_google_events,
+    list_google_events_in_range,
     update_google_event,
 )
-from app.services import analytics
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -34,14 +32,23 @@ router = APIRouter()
 # List events
 # ---------------------------------------------------------------------------
 
+
 @router.get("/events", response_model=list[GoogleCalendarEvent])
 async def get_events(
+    start_at: datetime = Query(..., alias="start"),
+    end_at: datetime = Query(..., alias="end"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List upcoming events from Google Calendar."""
+    """List events in an explicit, bounded date range."""
+    if start_at >= end_at:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="start must be before end")
+    if (end_at - start_at).days > 93:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Calendar range cannot exceed 93 days"
+        )
     try:
-        items = await list_google_events(user.id, db)
+        items = await list_google_events_in_range(user.id, db, start_at=start_at, end_at=end_at)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -73,6 +80,7 @@ async def get_events(
 # Create event
 # ---------------------------------------------------------------------------
 
+
 @router.post("/events", response_model=GoogleCalendarEvent)
 async def create_event(
     payload: CalendarEventCreate,
@@ -97,25 +105,13 @@ async def create_event(
     if payload.reminders:
         event_body["reminders"] = {
             "useDefault": False,
-            "overrides": [
-                {"method": "popup", "minutes": m} for m in payload.reminders
-            ],
+            "overrides": [{"method": "popup", "minutes": m} for m in payload.reminders],
         }
 
     try:
         result = await create_google_event(user.id, db, event_body=event_body)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    await analytics.track_event(
-        db,
-        user.id,
-        "manual_calendar_event_created",
-        {"eventId": result.get("id"), "title": payload.title},
-    )
-    await db.commit()
-
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return GoogleCalendarEvent(
         id=result.get("id", ""),
         title=result.get("summary", "Untitled"),
@@ -131,6 +127,7 @@ async def create_event(
 # ---------------------------------------------------------------------------
 # Update event
 # ---------------------------------------------------------------------------
+
 
 @router.put("/events/{event_id}", response_model=GoogleCalendarEvent)
 async def update_event(
@@ -160,30 +157,16 @@ async def update_event(
     if payload.reminders is not None:
         event_body["reminders"] = {
             "useDefault": False,
-            "overrides": [
-                {"method": "popup", "minutes": minutes} for minutes in payload.reminders
-            ],
+            "overrides": [{"method": "popup", "minutes": minutes} for minutes in payload.reminders],
         }
     if payload.metadata is not None:
         event_body["extendedProperties"] = {"private": payload.metadata}
 
     try:
-        await update_google_event(
-            user.id, db, event_id=event_id, event_body=event_body
-        )
+        await update_google_event(user.id, db, event_id=event_id, event_body=event_body)
         result = await get_google_event(user.id, db, event_id=event_id)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    await analytics.track_event(
-        db,
-        user.id,
-        "manual_calendar_event_updated",
-        {"eventId": event_id, "changedFields": sorted(event_body.keys())},
-    )
-    await db.commit()
-
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return GoogleCalendarEvent(
         id=result.get("id", ""),
         title=result.get("summary", "Untitled"),
@@ -200,6 +183,7 @@ async def update_event(
 # Delete event
 # ---------------------------------------------------------------------------
 
+
 @router.delete("/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_event(
     event_id: str,
@@ -210,8 +194,4 @@ async def remove_event(
     try:
         await delete_google_event(user.id, db, event_id=event_id)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        ) from exc
-    await analytics.track_event(db, user.id, "manual_calendar_event_deleted", {"eventId": event_id})
-    await db.commit()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

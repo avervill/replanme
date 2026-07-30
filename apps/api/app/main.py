@@ -1,4 +1,4 @@
-"""Resched.me FastAPI application entry point."""
+"""Replanme FastAPI application entry point."""
 
 from __future__ import annotations
 
@@ -11,10 +11,8 @@ from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.core.config import settings
-from app.core.database import init_db
 from app.core.logging import setup_logging
 from app.core.redis import close_redis
-from app.services.subscriptions import PaywallError
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +21,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     setup_logging("DEBUG" if settings.debug else "INFO")
     logger.info("Starting %s", settings.app_name)
-    await init_db()
     yield
     await close_redis()
     logger.info("Shutdown complete")
@@ -31,7 +28,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
+    version="1.0.0",
     lifespan=lifespan,
     description="API for AI-assisted scheduling, calendar orchestration, and structured life planning.",
 )
@@ -49,6 +46,7 @@ app.add_middleware(
 # Global exception handler
 # ---------------------------------------------------------------------------
 
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error on %s %s", request.method, request.url.path)
@@ -56,11 +54,6 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         status_code=500,
         content={"detail": "Internal server error"},
     )
-
-
-@app.exception_handler(PaywallError)
-async def paywall_exception_handler(request: Request, exc: PaywallError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content=exc.payload)
 
 
 # ---------------------------------------------------------------------------

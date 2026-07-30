@@ -1,210 +1,171 @@
-"""Authentication routes – Google OAuth2 flow + JWT issuance."""
+"""Google OAuth with PKCE and opaque, revocable browser sessions."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import logging
+import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.security import create_access_token, encrypt_token, get_current_user
-from app.models.calendar_connection import CalendarConnection
+from app.core.redis import get_redis
+from app.core.security import create_session, encrypt_token, get_optional_user, revoke_session
+from app.models.calendar_connection import GoogleConnection
 from app.models.user import User
-from app.schemas.auth import TokenResponse, UserResponse
-from app.services import analytics
-from app.services.credits import grant_signup_credits_if_needed, maybe_refill_credits
+from app.schemas.auth import SessionResponse, UserResponse
 from app.services.google_calendar import exchange_google_code, get_google_userinfo
-from app.services.paywall import normalize_subscription_status
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+OAUTH_STATE_TTL_SECONDS = 600
+GOOGLE_SCOPES = "openid email profile https://www.googleapis.com/auth/calendar"
 
 
-# ---------------------------------------------------------------------------
-# Step 1 — Redirect user to Google consent screen
-# ---------------------------------------------------------------------------
+def _oauth_configured() -> bool:
+    return bool(
+        settings.google_client_id
+        and settings.google_client_secret
+        and settings.google_redirect_uri
+        and settings.google_allowed_email_set
+    )
 
-@router.get("/google/url")
-async def get_google_auth_url() -> dict[str, str]:
-    if settings.missing_google_oauth_settings:
-        missing = ", ".join(settings.missing_google_oauth_settings)
+
+@router.get("/google/start")
+async def google_start() -> RedirectResponse:
+    if not _oauth_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Google OAuth is not configured. Missing: {missing}",
+            detail="Google OAuth or GOOGLE_ALLOWED_EMAILS is not configured",
         )
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    redis = await get_redis()
+    await redis.set(f"oauth:state:{state}", json.dumps({"verifier": verifier}), ex=OAUTH_STATE_TTL_SECONDS)
 
     query = urlencode(
         {
             "client_id": settings.google_client_id,
             "redirect_uri": settings.google_redirect_uri,
             "response_type": "code",
-            "scope": "openid email profile https://www.googleapis.com/auth/calendar",
+            "scope": GOOGLE_SCOPES,
             "access_type": "offline",
             "prompt": "consent",
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         }
     )
-    return {
-        "provider": "google",
-        "authorization_url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}",
-    }
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{query}", status_code=302)
 
-
-# ---------------------------------------------------------------------------
-# Step 2 — Google redirects back with ?code=...
-# ---------------------------------------------------------------------------
 
 @router.get("/google/callback")
 async def google_callback(
     code: str = Query(...),
+    state: str = Query(...),
     db: AsyncSession = Depends(get_db),
-):
-    """Exchange the Google authorization code for tokens, create or update the
-    user, store encrypted tokens, and redirect to the frontend with a JWT."""
+) -> RedirectResponse:
+    redis = await get_redis()
+    key = f"oauth:state:{state}"
+    raw = await redis.getdel(key)
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth state is invalid or expired")
+    verifier = json.loads(raw).get("verifier")
+    if not verifier:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth state is malformed")
 
-    if settings.missing_google_oauth_settings:
-        missing = ", ".join(settings.missing_google_oauth_settings)
+    try:
+        token_data = await exchange_google_code(code, code_verifier=verifier)
+        userinfo = await get_google_userinfo(token_data["access_token"])
+    except Exception as exc:
+        logger.warning("Google OAuth exchange failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google sign-in failed") from exc
+
+    email = str(userinfo.get("email", "")).casefold()
+    if email not in settings.google_allowed_email_set:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Google OAuth is not configured. Missing: {missing}",
+            status_code=status.HTTP_403_FORBIDDEN, detail="This Google account is not on the test-user allowlist"
         )
 
-    # 1. Exchange code for tokens
-    try:
-        token_data = await exchange_google_code(code)
-    except Exception as exc:
-        logger.error("Google token exchange failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to exchange authorization code",
-        ) from exc
-
-    access_token_google = token_data["access_token"]
-    refresh_token_google = token_data.get("refresh_token")
-    expires_in = token_data.get("expires_in", 3600)
-
-    # 2. Fetch user profile
-    try:
-        userinfo = await get_google_userinfo(access_token_google)
-    except Exception as exc:
-        logger.error("Google userinfo fetch failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to fetch user info from Google",
-        ) from exc
-
-    email = userinfo["email"]
-    full_name = userinfo.get("name")
-
-    # 3. Upsert user
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
-
     if user is None:
-        user = User(email=email, full_name=full_name)
-        user.is_admin = email.casefold() in settings.admin_email_set
+        user = User(email=email, full_name=userinfo.get("name"))
         db.add(user)
         await db.flush()
-        await grant_signup_credits_if_needed(db, user)
-        await analytics.track_event(db, user.id, "user_signed_up", {"provider": "google"})
-        logger.info("Created new user %s (%s)", user.id, email)
-    else:
-        if full_name and user.full_name != full_name:
-            user.full_name = full_name
-        user.is_admin = user.is_admin or email.casefold() in settings.admin_email_set
-        db.add(user)
-        await grant_signup_credits_if_needed(db, user)
-        await maybe_refill_credits(db, user.id)
-        await analytics.track_event(db, user.id, "user_logged_in", {"provider": "google"})
+    elif userinfo.get("name"):
+        user.full_name = userinfo["name"]
 
-    # 4. Upsert calendar connection with encrypted tokens
-    result = await db.execute(
-        select(CalendarConnection).where(
-            CalendarConnection.user_id == user.id,
-            CalendarConnection.provider == "google",
-        )
-    )
-    conn = result.scalar_one_or_none()
-
-    encrypted_access = encrypt_token(access_token_google)
-    encrypted_refresh = encrypt_token(refresh_token_google) if refresh_token_google else None
-    token_expiry = datetime.now(UTC) + timedelta(seconds=expires_in)
-
-    if conn is None:
-        conn = CalendarConnection(
+    result = await db.execute(select(GoogleConnection).where(GoogleConnection.user_id == user.id))
+    connection = result.scalar_one_or_none()
+    access = encrypt_token(token_data["access_token"])
+    refresh = token_data.get("refresh_token")
+    expiry = datetime.now(UTC) + timedelta(seconds=int(token_data.get("expires_in", 3600)))
+    if connection is None:
+        connection = GoogleConnection(
             user_id=user.id,
-            provider="google",
             external_email=email,
-            status="active",
-            scopes="openid email profile https://www.googleapis.com/auth/calendar",
-            access_token=encrypted_access,
-            refresh_token=encrypted_refresh,
-            token_expires_at=token_expiry,
+            scopes=GOOGLE_SCOPES,
+            access_token_encrypted=access,
+            refresh_token_encrypted=encrypt_token(refresh) if refresh else None,
+            token_expires_at=expiry,
         )
-        db.add(conn)
-        await analytics.track_event(db, user.id, "google_calendar_connected", {"provider": "google"})
     else:
-        conn.access_token = encrypted_access
-        if encrypted_refresh:
-            conn.refresh_token = encrypted_refresh
-        conn.token_expires_at = token_expiry
-        conn.status = "active"
-        db.add(conn)
-
+        connection.access_token_encrypted = access
+        connection.refresh_token_encrypted = encrypt_token(refresh) if refresh else connection.refresh_token_encrypted
+        connection.token_expires_at = expiry
+        connection.status = "active"
+    db.add(connection)
     await db.commit()
 
-    # 5. Issue JWT
-    jwt_token = create_access_token(user.id)
-
-    # 6. Redirect to frontend with the token
-    redirect_url = f"{settings.frontend_url}/auth/callback?token={jwt_token}"
-    return RedirectResponse(url=redirect_url)
-
-
-# ---------------------------------------------------------------------------
-# Authenticated endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> UserResponse:
-    """Return the authenticated user's profile."""
-    result = await db.execute(
-        select(CalendarConnection).where(
-            CalendarConnection.user_id == user.id,
-            CalendarConnection.provider == "google",
-        )
+    session_token = await create_session(user.id)
+    response = RedirectResponse(f"{settings.frontend_url}/dashboard", status_code=303)
+    response.set_cookie(
+        settings.session_cookie_name,
+        session_token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        secure=settings.cookie_secure or settings.is_production,
+        samesite="lax",
+        path="/",
     )
-    has_calendar = result.scalar_one_or_none() is not None
-    user.is_admin = user.is_admin or user.email.casefold() in settings.admin_email_set
-    await grant_signup_credits_if_needed(db, user)
-    await maybe_refill_credits(db, user.id)
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
+    return response
 
-    return UserResponse(
-        id=user.id,
-        email=user.email,
-        full_name=user.full_name,
-        timezone=user.timezone,
-        has_google_calendar=has_calendar,
-        plan=user.plan or "free",
-        subscription_status=normalize_subscription_status(user.subscription_status),
-        planning_credits=int(user.planning_credits or 0),
-        is_admin=bool(user.is_admin),
+
+@router.get("/session", response_model=SessionResponse)
+async def session(
+    user: User | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionResponse:
+    if user is None:
+        return SessionResponse(authenticated=False)
+    result = await db.execute(
+        select(GoogleConnection.id).where(GoogleConnection.user_id == user.id, GoogleConnection.status == "active")
+    )
+    return SessionResponse(
+        authenticated=True,
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            timezone=user.timezone,
+            has_google_calendar=result.scalar_one_or_none() is not None,
+        ),
     )
 
 
 @router.post("/logout")
-async def logout(user: User = Depends(get_current_user)):
-    """Logout placeholder — with JWTs, the client simply discards the token.
-    A future improvement can add token blacklisting via Redis."""
-    return {"detail": "Logged out successfully"}
+async def logout(request: Request) -> JSONResponse:
+    await revoke_session(request.cookies.get(settings.session_cookie_name))
+    response = JSONResponse({"detail": "Logged out"})
+    response.delete_cookie(settings.session_cookie_name, path="/")
+    return response

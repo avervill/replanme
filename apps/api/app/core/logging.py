@@ -8,9 +8,7 @@ import sys
 
 def setup_logging(level: str = "INFO") -> None:
     """Configure a structured log format for the application."""
-    fmt = (
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    )
+    fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%dT%H:%M:%S"))
 

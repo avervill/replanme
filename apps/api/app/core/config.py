@@ -1,97 +1,57 @@
-"""Application configuration with environment validation."""
+"""Typed runtime configuration for the Replanme API."""
 
 from __future__ import annotations
 
-import secrets
 from pathlib import Path
 
+from cryptography.fernet import Fernet
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def discover_env_files() -> tuple[Path | str, ...]:
     config_path = Path(__file__).resolve()
-    env_files: list[Path | str] = []
-
-    for directory in config_path.parents:
-        candidate = directory / ".env"
-        if candidate.exists():
-            env_files.append(candidate)
-
-    # Fall back to the process working directory for environments that inject
-    # a local .env next to the app entrypoint.
-    env_files.append(".env")
-
-    seen: set[str] = set()
-    unique_env_files: list[Path | str] = []
-    for env_file in env_files:
-        key = str(env_file)
-        if key not in seen:
-            seen.add(key)
-            unique_env_files.append(env_file)
-
-    return tuple(unique_env_files)
+    candidates = [parent / ".env" for parent in config_path.parents]
+    candidates.append(".env")
+    return tuple(dict.fromkeys(path for path in candidates if path == ".env" or path.exists()))
 
 
 class Settings(BaseSettings):
-    app_name: str = "Resched.me API"
+    app_name: str = "Replanme API"
     api_v1_prefix: str = "/api/v1"
+    environment: str = "development"
     debug: bool = False
 
-    # ----- Database -----
-    database_url: str = "sqlite+aiosqlite:///./reschedai.db"
-
-    # ----- Redis -----
+    database_url: str = "sqlite+aiosqlite:///./replanme.db"
     redis_url: str = "redis://localhost:6379/0"
 
-    # ----- Auth / Security -----
-    secret_key: str = secrets.token_urlsafe(32)
-    access_token_expire_minutes: int = 60 * 24  # 24 hours
-    admin_secret: str = ""
-    admin_emails: str = ""
-
-    # ----- Frontend -----
     frontend_url: str = "http://localhost:3000"
+    session_cookie_name: str = "replanme_session"
+    session_ttl_seconds: int = 60 * 60 * 24 * 7
+    cookie_secure: bool = False
+    token_encryption_key: str = ""
+    google_allowed_emails: str = ""
 
-    # ----- OpenAI -----
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
-    ai_simple_model: str = "gpt-4o-mini"
-    ai_complex_model: str = "gpt-5.4-mini"
-    ai_simple_max_output_tokens: int = 700
-    ai_complex_max_output_tokens: int = 1800
-    enable_ai_cost_logging: bool = True
-    max_study_hours_per_day: float = 8.0
-    whisper_model: str = "gpt-4o-mini-transcribe"
-    assistant_pending_plan_ttl_seconds: int = 60 * 30
-    assistant_conversation_ttl_seconds: int = 60 * 60 * 12
-    assistant_retry_attempts: int = 3
-    assistant_model_timeout_seconds: float = 25.0
-    assistant_smart_model_iterations: int = 3
-
-    # ----- Google OAuth -----
     google_client_id: str = ""
     google_client_secret: str = ""
-    google_redirect_uri: str = (
-        "http://localhost:8000/api/v1/auth/google/callback"
-    )
+    google_redirect_uri: str = "http://localhost:3000/api/v1/auth/google/callback"
+
+    openai_api_key: str = ""
+    ai_simple_model: str = "gpt-5.6-luna"
+    ai_complex_model: str = "gpt-5.6-terra"
+    transcription_model: str = "gpt-transcribe"
+    openai_timeout_seconds: float = 30.0
+    openai_max_retries: int = 2
+    plan_ttl_seconds: int = 60 * 30
+    rate_limit_requests: int = 30
+    rate_limit_window_seconds: int = 60
+    max_upload_bytes: int = 10 * 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_file=discover_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
-
-    @field_validator("debug", mode="before")
-    @classmethod
-    def parse_debug(cls, value: object) -> object:
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"release", "prod", "production"}:
-                return False
-            if normalized in {"debug", "dev", "development"}:
-                return True
-        return value
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -100,8 +60,19 @@ class Settings(BaseSettings):
             return value
         if value.startswith("postgres://"):
             return value.replace("postgres://", "postgresql+asyncpg://", 1)
-        if value.startswith("postgresql://"):
+        if value.startswith("postgresql://") and "+asyncpg" not in value:
             return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
+
+    @field_validator("token_encryption_key")
+    @classmethod
+    def validate_fernet_key(cls, value: str) -> str:
+        if not value:
+            return value
+        try:
+            Fernet(value.encode())
+        except ValueError as exc:
+            raise ValueError("TOKEN_ENCRYPTION_KEY must be a valid Fernet key") from exc
         return value
 
     @property
@@ -109,19 +80,12 @@ class Settings(BaseSettings):
         return [self.frontend_url, "http://127.0.0.1:3000"]
 
     @property
-    def missing_google_oauth_settings(self) -> list[str]:
-        missing: list[str] = []
-        if not self.google_client_id:
-            missing.append("GOOGLE_CLIENT_ID")
-        if not self.google_client_secret:
-            missing.append("GOOGLE_CLIENT_SECRET")
-        if not self.google_redirect_uri:
-            missing.append("GOOGLE_REDIRECT_URI")
-        return missing
+    def google_allowed_email_set(self) -> set[str]:
+        return {email.strip().casefold() for email in self.google_allowed_emails.split(",") if email.strip()}
 
     @property
-    def admin_email_set(self) -> set[str]:
-        return {email.strip().casefold() for email in self.admin_emails.split(",") if email.strip()}
+    def is_production(self) -> bool:
+        return self.environment.casefold() == "production"
 
 
 settings = Settings()

@@ -9,8 +9,8 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import decrypt_token, encrypt_token
 from app.core.config import settings
+from app.core.security import decrypt_token, encrypt_token
 from app.models.calendar_connection import CalendarConnection
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,8 @@ def _rfc3339(value: datetime) -> str:
 # Token helpers
 # ---------------------------------------------------------------------------
 
-async def exchange_google_code(code: str) -> dict:
+
+async def exchange_google_code(code: str, *, code_verifier: str) -> dict:
     """Exchange an authorization code for access + refresh tokens."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -41,6 +42,7 @@ async def exchange_google_code(code: str) -> dict:
                 "client_secret": settings.google_client_secret,
                 "redirect_uri": settings.google_redirect_uri,
                 "grant_type": "authorization_code",
+                "code_verifier": code_verifier,
             },
         )
         resp.raise_for_status()
@@ -78,25 +80,22 @@ async def get_google_userinfo(access_token: str) -> dict:
 # Ensure valid access token (auto-refresh if expired)
 # ---------------------------------------------------------------------------
 
-async def _ensure_valid_token(
-    conn: CalendarConnection, db: AsyncSession
-) -> str:
+
+async def _ensure_valid_token(conn: CalendarConnection, db: AsyncSession) -> str:
     """Return a valid Google access token, refreshing if expired."""
-    if conn.access_token is None:
+    if not conn.access_token_encrypted:
         raise ValueError("No access token stored for this connection")
 
-    access = decrypt_token(conn.access_token)
+    access = decrypt_token(conn.access_token_encrypted)
 
     if conn.token_expires_at and conn.token_expires_at < datetime.now(UTC):
-        if conn.refresh_token is None:
+        if conn.refresh_token_encrypted is None:
             raise ValueError("Token expired and no refresh token available")
         logger.info("Refreshing expired Google token for user %s", conn.user_id)
-        token_data = await refresh_google_token(decrypt_token(conn.refresh_token))
+        token_data = await refresh_google_token(decrypt_token(conn.refresh_token_encrypted))
         access = token_data["access_token"]
-        conn.access_token = encrypt_token(access)
-        conn.token_expires_at = datetime.now(UTC) + timedelta(
-            seconds=token_data.get("expires_in", 3600)
-        )
+        conn.access_token_encrypted = encrypt_token(access)
+        conn.token_expires_at = datetime.now(UTC) + timedelta(seconds=token_data.get("expires_in", 3600))
         db.add(conn)
         await db.commit()
         await db.refresh(conn)
@@ -104,9 +103,7 @@ async def _ensure_valid_token(
     return access
 
 
-async def _get_connection(
-    user_id, db: AsyncSession
-) -> CalendarConnection:
+async def _get_connection(user_id, db: AsyncSession) -> CalendarConnection:
     result = await db.execute(
         select(CalendarConnection).where(
             CalendarConnection.user_id == user_id,
@@ -123,9 +120,8 @@ async def _get_connection(
 # Calendar CRUD operations
 # ---------------------------------------------------------------------------
 
-async def list_google_events(
-    user_id, db: AsyncSession, *, max_results: int = 250
-) -> list[dict]:
+
+async def list_google_events(user_id, db: AsyncSession, *, max_results: int = 250) -> list[dict]:
     """List upcoming events from the user's primary Google Calendar."""
     now = datetime.now(UTC)
     return await list_google_events_in_range(
@@ -165,9 +161,7 @@ async def list_google_events_in_range(
         return resp.json().get("items", [])
 
 
-async def create_google_event(
-    user_id, db: AsyncSession, *, event_body: dict
-) -> dict:
+async def create_google_event(user_id, db: AsyncSession, *, event_body: dict) -> dict:
     """Create an event on the user's primary Google Calendar."""
     conn = await _get_connection(user_id, db)
     access = await _ensure_valid_token(conn, db)
@@ -182,9 +176,7 @@ async def create_google_event(
         return resp.json()
 
 
-async def update_google_event(
-    user_id, db: AsyncSession, *, event_id: str, event_body: dict
-) -> dict:
+async def update_google_event(user_id, db: AsyncSession, *, event_id: str, event_body: dict) -> dict:
     """Update an existing event on the user's primary Google Calendar."""
     conn = await _get_connection(user_id, db)
     access = await _ensure_valid_token(conn, db)
@@ -218,9 +210,7 @@ async def get_google_event(
         return resp.json()
 
 
-async def delete_google_event(
-    user_id, db: AsyncSession, *, event_id: str
-) -> None:
+async def delete_google_event(user_id, db: AsyncSession, *, event_id: str) -> None:
     """Delete an event from the user's primary Google Calendar."""
     conn = await _get_connection(user_id, db)
     access = await _ensure_valid_token(conn, db)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from cryptography.fernet import Fernet
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     debug: bool = False
 
     database_url: str = "sqlite+aiosqlite:///./replanme.db"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        validation_alias=AliasChoices("REDIS_URL", "KV_URL", "UPSTASH_REDIS_URL"),
+    )
 
     frontend_url: str = "http://localhost:3000"
     session_cookie_name: str = "replanme_session"
@@ -51,6 +54,7 @@ class Settings(BaseSettings):
         env_file=discover_env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator("database_url", mode="before")

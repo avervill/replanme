@@ -7,7 +7,7 @@
 
 An approval-first AI calendar for students and early-career professionals. Replanme turns deadlines, timetable photos, and recorded voice notes into realistic Google Calendar proposals built around energy—not merely empty time.
 
-> Live demo will be linked here after the Vercel production project is re-authenticated.
+> Live product: [replanme.vercel.app](https://replanme.vercel.app) · [read-only demo](https://replanme.vercel.app/demo)
 
 ![Replanme landing page](docs/assets/landing.png)
 
@@ -46,11 +46,11 @@ The assistant uses a modular LangGraph workflow: `context → route → plan →
 ```mermaid
 flowchart TB
     B["Browser · Next.js 16"] -->|same-origin /api/v1| V["Vercel rewrite"]
-    V --> A["FastAPI · Railway"]
+    V --> A["FastAPI · Vercel Functions"]
     A --> O["OpenAI Responses API"]
     A --> G["Google Calendar API"]
-    A --> P[("Postgres")]
-    A --> R[("Redis")]
+    A --> P[("Neon Postgres")]
+    A --> R[("Upstash Redis")]
     R --> S["Sessions · OAuth state/PKCE · pending plans · rate limits"]
     P --> D["Profiles · memories · planning runs · action audit"]
 ```
@@ -64,7 +64,7 @@ flowchart TB
 | Data | PostgreSQL, Redis |
 | Providers | Google OAuth 2.0 + PKCE, Google Calendar API |
 | Quality | Ruff, pytest + coverage, ESLint, Vitest, Playwright, axe |
-| Hosting | Vercel (web), Railway (API, Postgres, Redis) |
+| Hosting | Vercel (Next.js + FastAPI Functions), Neon Postgres, Upstash Redis |
 
 ## Repository
 
@@ -161,11 +161,11 @@ The browser suite covers 1440px and 390px layouts, keyboard navigation, demo gat
 
 ## Deployment
 
-- **Railway:** deploy `apps/api/Dockerfile`, attach a new Postgres database and Redis service, and set the variables in [`.env.example`](.env.example). The container runs `alembic upgrade head` before Uvicorn and exposes `/api/v1/health`.
-- **Vercel:** use `apps/web` as the project root, set server-only `API_ORIGIN` to the Railway domain, set `NEXT_PUBLIC_SITE_URL`, and deploy from `main`.
+- **API project:** use `apps/api` as a Vercel FastAPI project root. Connect Neon Postgres and Upstash Redis from Vercel Marketplace, run the clean Alembic baseline once, and expose `/api/v1/health`.
+- **Web project:** use `apps/web` as the Vercel Next.js project root, set server-only `API_ORIGIN` to the API project production URL, and set `NEXT_PUBLIC_SITE_URL=https://replanme.vercel.app`.
 - Set `GOOGLE_REDIRECT_URI` to `https://<vercel-domain>/api/v1/auth/google/callback`.
 
-See [Railway deployment notes](docs/railway-deploy.md).
+See [Vercel full-stack deployment notes](docs/vercel-deploy.md).
 
 ## Current limitations
 

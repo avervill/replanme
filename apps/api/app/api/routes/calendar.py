@@ -42,10 +42,10 @@ async def get_events(
 ):
     """List events in an explicit, bounded date range."""
     if start_at >= end_at:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="start must be before end")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="start must be before end")
     if (end_at - start_at).days > 93:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Calendar range cannot exceed 93 days"
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Calendar range cannot exceed 93 days"
         )
     try:
         items = await list_google_events_in_range(user.id, db, start_at=start_at, end_at=end_at)

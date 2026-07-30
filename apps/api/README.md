@@ -1,16 +1,11 @@
-# Resched.me API
+# Replanme API
 
-FastAPI backend for:
-
-- Google Calendar connection and guarded write operations
-- LLM planning requests
-- Energy-aware scheduling previews
-- Voice-to-calendar intent parsing
-- Schedule photo import previews
-
-Run locally:
+FastAPI service for Google Calendar OAuth/CRUD, approval-first LangGraph proposals, in-memory image import, recorded voice transcription, and idempotent plan execution.
 
 ```bash
-pip install -e .
-uvicorn app.main:app --reload
+uv sync --extra dev
+uv run alembic upgrade head
+uv run uvicorn app.main:app --reload
 ```
+
+See the [repository README](../../README.md) for environment variables, contracts, tests, and deployment.

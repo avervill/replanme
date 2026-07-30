@@ -1,20 +1,18 @@
 import type { Metadata } from "next";
-import { Epilogue, Syne } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import { AuthProvider } from "@/lib/auth";
 import "./globals.css";
 
 const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 
-const syne = Syne({
+const geist = Geist({
   subsets: ["latin"],
-  variable: "--font-display",
-  weight: ["500", "600", "700", "800"],
+  variable: "--font-sans",
 });
 
-const epilogue = Epilogue({
+const geistMono = Geist_Mono({
   subsets: ["latin"],
-  variable: "--font-body",
-  weight: ["400", "500", "600", "700"],
+  variable: "--font-mono",
 });
 
 export const metadata: Metadata = {
@@ -23,12 +21,15 @@ export const metadata: Metadata = {
     default: "replanme",
     template: "%s | replanme",
   },
-  description: "AI-assisted scheduling for Google Calendar, weekly planning, and monthly planning.",
+  description: "Turn deadlines, photos, and voice notes into a realistic week in Google Calendar.",
   applicationName: "replanme",
   category: "productivity",
   openGraph: {
+    title: "replanme — plan around your actual energy",
+    description: "An AI calendar for ambitious weeks that still leave room to recover.",
     siteName: "replanme",
     type: "website",
+    images: ["/og.png"],
   },
   twitter: {
     card: "summary_large_image",
@@ -42,7 +43,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${syne.variable} ${epilogue.variable}`}>
+      <body className={`${geist.variable} ${geistMono.variable}`}>
         <AuthProvider>{children}</AuthProvider>
       </body>
     </html>

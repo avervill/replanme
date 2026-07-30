@@ -1,9 +1,9 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: reschedai-postgres
+    container_name: replanme-postgres
     environment:
-      POSTGRES_DB: reschedai
+      POSTGRES_DB: replanme
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
@@ -13,27 +13,28 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: reschedai-redis
+    container_name: replanme-redis
     ports:
       - "6379:6379"
 
   api:
     build:
-      context: ./apps/api
-    container_name: reschedai-api
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: replanme-api
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/reschedai
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/replanme
       REDIS_URL: redis://redis:6379/0
       FRONTEND_URL: http://localhost:3000
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      AI_SIMPLE_MODEL: ${AI_SIMPLE_MODEL:-gpt-4o-mini}
-      AI_COMPLEX_MODEL: ${AI_COMPLEX_MODEL:-gpt-5.4-mini}
-      WHISPER_MODEL: ${WHISPER_MODEL:-gpt-4o-mini-transcribe}
+      AI_SIMPLE_MODEL: ${AI_SIMPLE_MODEL:-gpt-5.6-luna}
+      AI_COMPLEX_MODEL: ${AI_COMPLEX_MODEL:-gpt-5.6-terra}
+      TRANSCRIPTION_MODEL: ${TRANSCRIPTION_MODEL:-gpt-transcribe}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+      GOOGLE_ALLOWED_EMAILS: ${GOOGLE_ALLOWED_EMAILS:-}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/auth/google/callback}
-      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:3000/api/v1/auth/google/callback}
     depends_on:
       - postgres
       - redis
@@ -48,10 +49,10 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
       args:
-        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
-    container_name: reschedai-web
+        API_ORIGIN: http://api:8000
+    container_name: replanme-web
     environment:
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000/api/v1}
+      API_ORIGIN: http://api:8000
     depends_on:
       - api
     ports:

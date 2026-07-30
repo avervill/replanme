@@ -8,15 +8,14 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin
 
 
-class PlanningMemory(TimestampMixin, Base):
-    __tablename__ = "planning_memories"
+class LongTermMemory(TimestampMixin, Base):
+    __tablename__ = "long_term_memories"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        index=True,
-        unique=True,
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True
     )
-    memory: Mapped[dict] = mapped_column(JSON, default=dict)
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
 
+
+PlanningMemory = LongTermMemory

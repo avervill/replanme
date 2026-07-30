@@ -43,6 +43,7 @@ class CalendarEventResponse(CalendarEventBase):
 
 class GoogleCalendarEvent(BaseModel):
     """Normalized response from Google Calendar API."""
+
     id: str
     title: str
     description: str | None = None

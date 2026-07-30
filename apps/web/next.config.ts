@@ -1,10 +1,11 @@
-import path from "node:path";
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   devIndicators: false,
-  outputFileTracingRoot: path.resolve(__dirname, "../.."),
+  turbopack: {
+    root: __dirname,
+  },
   async rewrites() {
     const apiOrigin = process.env.API_ORIGIN ?? "http://localhost:8000";
     return [

@@ -8,10 +8,16 @@ def test_vercel_marketplace_connection_aliases(monkeypatch):
     monkeypatch.setenv("KV_URL", "rediss://default:secret@example.upstash.io:6379")
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql://user:secret@example-pooler.neon.tech/replanme?sslmode=require",
+        (
+            "postgresql://user:secret@example-pooler.neon.tech/replanme"
+            "?sslmode=require&channel_binding=require"
+        ),
     )
 
     config = Settings(_env_file=None)
 
     assert config.redis_url.startswith("rediss://")
     assert config.database_url.startswith("postgresql+asyncpg://")
+    assert "ssl=require" in config.database_url
+    assert "sslmode=" not in config.database_url
+    assert "channel_binding=" not in config.database_url
